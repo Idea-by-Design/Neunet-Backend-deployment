@@ -89,7 +89,9 @@ def upsert_jobDetails(jobData):
         
     except Exception as e:
         print(f"An error occurred while upserting job: {e}")
-        raise e
+        print("Saving candidate data:", application_data)
+        fetch_resume_with_email_and_job(job_id, email)
+        upsert_candidate(application_data)
 
 def upsert_candidate(candidate_data):
     """
@@ -97,6 +99,7 @@ def upsert_candidate(candidate_data):
     """
     try:
         print(f"Upserting candidate application for job {candidate_data['job_id']}")
+        print("Candidate data to upsert:", candidate_data)
         # Create composite ID from job_id and email
         candidate_data["id"] = f"{candidate_data['job_id']}_{candidate_data['email']}"
         containers[config['database']['application_container_name']].upsert_item(candidate_data)
@@ -284,27 +287,53 @@ def fetch_job_description_questionnaire(job_id):
         print(f"An error occurred while fetching job description questionnaire: {e}")
         return None
 
+def fetch_resume_with_email_and_job(job_id, email):
+    try:
+        query = """
+        SELECT * 
+        FROM c
+        WHERE IS_DEFINED(c.email) AND c.email = @email AND c.job_id = @job_id AND c.type = 'candidate'
+        """
+        parameters = [
+            {"name": "@email", "value": email},
+            {"name": "@job_id", "value": job_id}
+        ]
+        print(f"Executing query to fetch candidate (type='candidate') for job_id: {job_id}, email: {email}...")
+        candidates = containers[config['database']['application_container_name']].query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True
+        )
+        for candidate in candidates:
+            print(f"Candidate application fetched successfully! Candidate: {candidate}")
+            return candidate  # Return the first matched document
+        print("No candidate found for the given email and job_id.")
+        return None
+    except Exception as e:
+        print(f"An error occurred while fetching candidate: {e}")
+        return None
+
 def fetch_resume_with_email(email):
     try:
         query = """
         SELECT * 
         FROM c
-        WHERE c.type = 'resume' AND IS_DEFINED(c.email) AND c.email = @email
+        WHERE IS_DEFINED(c.email) AND c.email = @email AND c.type = 'candidate'
         """
         parameters = [
             {"name": "@email", "value": email}
         ]
 
-        print(f"Executing query to fetch resume for email: {email}...")
+        print(f"Executing query to fetch candidate (type='candidate') for email: {email}...")
 
-        candidates = containers[config['database']['resumes_container_name']].query_items(
+        candidates = containers[config['database']['application_container_name']].query_items(
             query=query,
             parameters=parameters,
             enable_cross_partition_query=True
         )
         
         for candidate in candidates:
-            print("Resume fetched successfully!")
+            print(f"Candidate application fetched successfully! Candidate: {candidate}")
             return candidate  # Return the first matched document
         
         print("No resume found for the given email.")

@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional
@@ -11,6 +12,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from common.database.cosmos import db_operations
+from azure.storage.blob import BlobServiceClient
+import io
 
 app = FastAPI(title="Neunet Recruitment API")
 
@@ -178,13 +181,25 @@ async def update_candidate_status(job_id: str, candidate_email: str, status: str
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/candidates/{email}/resume")
-async def get_candidate_resume(email: str):
+@app.get("/candidates/{job_id}/{email}/resume")
+async def get_candidate_resume(job_id: str, email: str):
     try:
-        resume = db_operations.fetch_resume_with_email(email)
-        if not resume:
+        candidate = db_operations.fetch_resume_with_email_and_job(job_id, email)
+        if not candidate or "resume_blob_name" not in candidate:
             raise HTTPException(status_code=404, detail="Resume not found")
-        return resume
+        blob_name = candidate["resume_blob_name"]
+        AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        CONTAINER_NAME = "resumes"
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+        blob_client = container_client.get_blob_client(blob_name)
+        stream = io.BytesIO()
+        blob_data = blob_client.download_blob()
+        blob_data.readinto(stream)
+        stream.seek(0)
+        return StreamingResponse(stream, media_type="application/pdf", headers={
+            "Content-Disposition": f"attachment; filename={os.path.basename(blob_name)}"
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -200,33 +215,68 @@ async def get_job_applications(job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/{job_id}/apply")
-async def apply_for_job(job_id: str, application: CandidateApplication):
+async def apply_for_job(
+    job_id: str,
+    name: str = Form(...),
+    email: str = Form(...),
+    cover_letter: str = Form(None),
+    ranking: float = Form(0.85),
+    resume: UploadFile = File(...)
+):
     try:
-        print(f"Received application for job {job_id}: {application}")  # Debug log
-        
-        # Create application data
+        AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        CONTAINER_NAME = "resumes"
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+        ext = os.path.splitext(resume.filename)[-1]
+        timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+        blob_name = f"{email}_{timestamp}{ext}"
+        blob_client = container_client.get_blob_client(blob_name)
+        data = await resume.read()
+        blob_client.upload_blob(data, overwrite=True)
+        # Parse the uploaded resume and store extracted info (github/linkedin/etc)
+        parsed_resume = None
+        try:
+            # Save file to temp
+            import tempfile
+            suffix = os.path.splitext(resume.filename)[-1].lower()
+            fd, temp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+            with open(temp_path, "wb") as out_file:
+                out_file.write(data)
+            if suffix == '.pdf':
+                text, hyperlinks = parse_pdf(temp_path)
+            elif suffix in ['.doc', '.docx']:
+                text, hyperlinks = parse_doc(temp_path)
+            else:
+                text, hyperlinks = '', []
+            parsed_resume = parse_resume_json(text, hyperlinks)
+        except Exception as e:
+            print(f"[WARN] Resume parsing failed: {e}")
+            parsed_resume = None
+        finally:
+            try:
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
         application_data = {
-            "id": f"{job_id}_{application.email}",  # Composite key for job_id and email
+            "id": f"{job_id}_{email}",
             "job_id": job_id,
-            "name": application.name,
-            "email": application.email,
-            "resume": application.resume,
-            "cover_letter": application.cover_letter,
-            "ranking": application.ranking,
+            "name": name,
+            "email": email,
+            "cover_letter": cover_letter,
+            "ranking": ranking,
             "status": "applied",
             "applied_at": datetime.utcnow().isoformat(),
-            "type": "candidate"  # Identify this as a candidate record
+            "type": "candidate",
+            "resume_blob_name": blob_name,
+            "resume": parsed_resume if parsed_resume else None
         }
-        
-        print(f"Submitting application: {application_data}")  # Debug log
-        
-        # Store in Cosmos DB
-        result = db_operations.upsert_candidate(application_data)
-        print(f"Application submitted: {result}")  # Debug log
-        
+        db_operations.upsert_candidate(application_data)
         return {"message": "Application submitted successfully"}
     except Exception as e:
-        print(f"Error submitting application: {e}")  # Debug log
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/debug/candidates/{job_id}")
