@@ -224,6 +224,14 @@ async def apply_for_job(
     resume: UploadFile = File(...)
 ):
     try:
+        # Defensive logging and checks
+        if resume is None:
+            print("[ERROR] No resume file provided.")
+            raise HTTPException(status_code=400, detail="No resume file provided.")
+        if not hasattr(resume, 'filename') or resume.filename is None:
+            print(f"[ERROR] Resume filename is missing or None. Resume object: {resume}")
+            raise HTTPException(status_code=400, detail="Resume filename is missing.")
+        print(f"[DEBUG] Received resume filename: {resume.filename}")
         AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
         CONTAINER_NAME = "resumes"
         blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
@@ -233,6 +241,9 @@ async def apply_for_job(
         blob_name = f"{email}_{timestamp}{ext}"
         blob_client = container_client.get_blob_client(blob_name)
         data = await resume.read()
+        if data is None or len(data) == 0:
+            print("[ERROR] Resume file is empty.")
+            raise HTTPException(status_code=400, detail="Resume file is empty.")
         blob_client.upload_blob(data, overwrite=True)
         # Parse the uploaded resume and store extracted info (github/linkedin/etc)
         parsed_resume = None
@@ -276,7 +287,12 @@ async def apply_for_job(
         }
         db_operations.upsert_candidate(application_data)
         return {"message": "Application submitted successfully"}
+    except HTTPException as e:
+        # Already a handled error
+        raise e
     except Exception as e:
+        import traceback
+        print(f"[ERROR] Exception in apply_for_job: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/debug/candidates/{job_id}")

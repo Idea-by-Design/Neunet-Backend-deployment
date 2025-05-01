@@ -14,6 +14,11 @@ client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=o
 model= os.getenv("deployment_name")
 
 def parse_resume_json(resume_text, links=None):
+    if resume_text is None:
+        raise ValueError("resume_text cannot be None")
+    if not isinstance(resume_text, str):
+        raise ValueError("resume_text must be a string")
+
     print("[DEBUG] resume_text sent to OpenAI:\n", resume_text)
     print("[DEBUG] links sent to OpenAI:\n", links)
     
@@ -127,10 +132,10 @@ def parse_resume_json(resume_text, links=None):
 
     raw_response = response.choices[0].message.content
     
+    print("[DEBUG] raw_response from OpenAI:\n", raw_response)
+
     start_idx = raw_response.find("{")
     end_idx = raw_response.rfind("}")
-
-    
 
     try:
         json_data = json.loads(raw_response[start_idx:end_idx+1])
@@ -139,4 +144,3 @@ def parse_resume_json(resume_text, links=None):
         raise
     
     return json_data
-
