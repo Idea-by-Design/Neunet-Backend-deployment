@@ -2,6 +2,7 @@ from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from common.utils.config_utils import load_config
 from datetime import datetime
 import ast
+import uuid
 
 
 # Load configuration
@@ -22,6 +23,18 @@ try:
 except Exception as e:
     print(f"Error creating/accessing database: {e}")
     raise e
+
+# Fetch applications by candidate_id (for UUID lookup)
+def fetch_applications_by_candidate(candidate_id):
+    global containers, config
+    query = f"SELECT * FROM c WHERE c.candidate_id = '{candidate_id}'"
+    return list(containers[config['database']['application_container_name']].query_items(query=query, enable_cross_partition_query=True))
+
+# Fetch applications by candidate email (for fallback lookup)
+def fetch_applications_by_candidate_email(email):
+    global container  # Assumes container is initialized at module level
+    query = f"SELECT * FROM c WHERE c.email = '{email}'"
+    return list(container.query_items(query=query, enable_cross_partition_query=True))
 
 # Initialize containers
 def ensure_containers():
@@ -96,10 +109,15 @@ def upsert_jobDetails(jobData):
 def upsert_candidate(candidate_data):
     """
     Upsert a candidate application into the database.
+    Adds a globally unique candidate_id if not present.
     """
     try:
         print(f"Upserting candidate application for job {candidate_data['job_id']}")
         print("Candidate data to upsert:", candidate_data)
+        # Generate candidate_id if not present
+        if not candidate_data.get("candidate_id"):
+            candidate_data["candidate_id"] = str(uuid.uuid4())
+            print(f"Generated new candidate_id: {candidate_data['candidate_id']}")
         # Create composite ID from job_id and email
         candidate_data["id"] = f"{candidate_data['job_id']}_{candidate_data['email']}"
         containers[config['database']['application_container_name']].upsert_item(candidate_data)

@@ -173,6 +173,53 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/candidates/{candidate_id}")
+async def get_candidate_by_id(candidate_id: str):
+    """
+    Return candidate profile and all jobs they've applied to.
+    candidate_id can be email or unique candidate id.
+    """
+    try:
+        # Fetch all applications for this candidate by candidate_id
+        applications = db_operations.fetch_applications_by_candidate(candidate_id)
+        # Fallback: if not found, try lookup by email
+        if not applications or len(applications) == 0:
+            applications = db_operations.fetch_applications_by_candidate_email(candidate_id)
+        if not applications or len(applications) == 0:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        # Profile fields from one application (assuming all have same candidate info)
+        profile_fields = [
+            'name', 'email', 'avatar', 'role', 'evaluation', 'github', 'skills', 'resume', 'resume_blob_name', 'cover_letter', 'ranking'
+        ]
+        candidate_profile = {k: applications[0].get(k) for k in profile_fields if k in applications[0]}
+        # List of jobs applied to
+        jobs_applied = []
+        for app in applications:
+            job_id = app.get('job_id')
+            job_title = app.get('job_title')
+            # Patch: Always fetch job title if missing
+            if not job_title and job_id:
+                job_desc = db_operations.fetch_job_description(job_id)
+                job_title = job_desc['title'] if job_desc and 'title' in job_desc else job_id
+            jobs_applied.append({
+                'job_id': job_id,
+                'title': job_title,
+                'status': app.get('status'),
+                'applied_at': app.get('applied_at'),
+                'ranking': app.get('ranking'),
+                'resume_blob_name': app.get('resume_blob_name'),
+                'score': app.get('score') or app.get('ranking'),
+            })
+        candidate_profile['jobsApplied'] = jobs_applied
+        # Add parsed_resume details if available
+        if 'resume' in applications[0] and isinstance(applications[0]['resume'], dict):
+            candidate_profile['parsed_resume'] = applications[0]['resume']
+        # Add a unique candidate_id (use email for now if no id field)
+        candidate_profile['candidate_id'] = applications[0].get('candidate_id') or applications[0].get('email')
+        return candidate_profile
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/jobs/{job_id}/candidates/{candidate_email}/status")
 async def update_candidate_status(job_id: str, candidate_email: str, status: str):
     try:
