@@ -1,6 +1,6 @@
 import os
 from services.resume_ranking.job_description_questionnaire.jd_questionnaire_generator import generate_questionnaire, save_questionnaire
-from common.database.cosmos.db_operations import fetch_job_description, store_job_questionnaire
+from neunet_ai_services.common.database.cosmos.db_operations import fetch_job_description, store_job_questionnaire
 import json
 import datetime
 

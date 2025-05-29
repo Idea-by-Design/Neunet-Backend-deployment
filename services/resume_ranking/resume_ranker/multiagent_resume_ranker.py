@@ -2,11 +2,14 @@ import autogen
 import os
 import uuid
 import json
-from common.database.cosmos.db_operations import fetch_application_by_job_id,  fetch_application_by_job_id, create_application_for_job_id, save_ranking_data_to_cosmos_db
+from common.database.cosmos.db_operations import fetch_application_by_job_id, create_application_for_job_id, save_ranking_data_to_cosmos_db
 from dotenv import load_dotenv
 
 # Load environment variables from .env file in the project directory
-load_dotenv(dotenv_path=".env")
+from pathlib import Path
+# Always load .env from backend root
+backend_root = Path(__file__).resolve().parent.parent.parent.parent
+load_dotenv(backend_root / ".env")
 
 
 # # Fetch the API key from environment variables
@@ -25,10 +28,124 @@ config_list = [{"model": os.getenv("deployment_name"),
                             "api_version": os.getenv("api_version")}]
 
 def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candidate_email, job_questionnaire):
+    import logging
+    # Debug: Show resume type and preview
+    try:
+        print(f"[DEBUG] [initiate_chat] Type of resume for candidate_email {candidate_email}: {type(resume)}")
+        if isinstance(resume, str):
+            print(f"[DEBUG] [initiate_chat] Preview of resume: {resume[:200]}...")
+        else:
+            print(f"[DEBUG] [initiate_chat] Resume is not a string. Value: {repr(resume)}")
+        # Validate resume
+        if not resume or not isinstance(resume, str) or resume.strip() == "":
+            logging.warning(f"[RANKING] Skipping ranking for {candidate_email}: Resume is missing or invalid.")
+            print(f"[DEBUG] [initiate_chat] Skipping ranking for {candidate_email}: Resume is missing or invalid.")
+            return None
+        print(f"[DEBUG] [initiate_chat] Starting ranking for job_id={job_id}, candidate_email={candidate_email}")
 
+        # Use the job_questionnaire that is passed as an argument
+        questionnaire = job_questionnaire
 
-    # Fetching the API key from the environment variable
-    # api_key=os.getenv("AZURE_OPENAI_API_KEY")
+        # Terminates the conversation if the message is "TERMINATE"
+        def is_termination_msg(message):
+            has_content = "content" in message and message["content"] is not None
+            return has_content and "TERMINATE" in message["content"]
+
+        def create_json_safe_payload(data):
+            try:
+                # Convert the data to a JSON-compatible string
+                return json.dumps(data, ensure_ascii=False)
+            except (TypeError, ValueError) as e:
+                print(f"Error creating JSON payload: {e}")
+                return None
+
+        # Ranking tool function
+        def ranking_tool(candidate_email, ranking, conversation, resume):
+            print(f"[DEBUG] Entered ranking_tool for candidate_email={candidate_email}, ranking={ranking}")
+            try:
+                # Sanitize all inputs to avoid JSON errors
+                candidate_email_safe = create_json_safe_payload(candidate_email)
+                resume_safe = create_json_safe_payload(resume)
+                conversation_safe = create_json_safe_payload(conversation)
+
+                if not all([candidate_email_safe, resume_safe, conversation_safe]):
+                    print("[DEBUG] Error: One or more payload fields could not be converted to JSON-safe format.")
+                    print("[DEBUG] Returning early from ranking_tool due to payload error.")
+                    return "Payload creation failed due to special characters."
+
+                # Fetch the application data from Cosmos DB using job_id
+                ranking_data = fetch_application_by_job_id(job_id)
+
+                # If no ranking data is found, create a new application
+                if not ranking_data:
+                    print(f"[DEBUG] No ranking_data found for job_id={job_id}, creating new application.")
+                    ranking_data = create_application_for_job_id(job_id, job_questionnaire_id)
+
+                # Generate a unique ID for the ranking entry (using job_id and job_questionnaire_id)
+                unique_id = f"{job_id}_{job_questionnaire_id}_{str(uuid.uuid4())}"
+
+                try:
+                    # Debug print before saving
+                    print(f"[DEBUG] About to call save_ranking_data_to_cosmos_db for job_id={job_id}, candidate_email={candidate_email}")
+                    print(f"[DEBUG] ranking_data: {json.dumps(ranking_data, indent=2)}")
+                    print(f"[DEBUG] ranking: {ranking}")
+                    result = save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conversation, resume)
+                    print(f"[DEBUG] Result from save_ranking_data_to_cosmos_db: {result}")
+                    print("[DEBUG] Returning success from ranking_tool")
+                    return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
+                except Exception as e:
+                    print(f"[ERROR] Exception in ranking_tool for candidate_email {candidate_email}: {e}")
+                    import traceback; traceback.print_exc()
+                    print("[DEBUG] Returning error from ranking_tool due to exception.")
+                    return None
+
+            except Exception as e:
+                print(f"[ERROR] An error occurred in the ranking tool: {e}")
+                import traceback; traceback.print_exc()
+                print("[DEBUG] Returning error from ranking_tool due to outer exception.")
+                return None
+
+        # User proxy (The user proxy is the main object that you will use to interact with the assistant)
+        user_proxy = autogen.UserProxyAgent(name="user_proxy", system_message="You're the hiring manager", 
+                                            human_input_mode="NEVER", is_termination_msg=is_termination_msg, 
+                                            function_map={"ranking_tool": ranking_tool}, 
+                                            code_execution_config={"use_docker": False})
+        
+        # Job description analysis agent to analyze the job description and refer to the questionnaire
+        job_description_analyst = autogen.AssistantAgent(
+            name="job_description_analyst",
+            system_message=f"""As the job description analysis agent,
+            you will ask relevant questions based on the job questionnaire to assess the candidate's fit. Here are the questions from the job questionnaire:
+            {questionnaire}
+            Show the questionnaire to resume analyst with questions, weights.
+            Ask the resume analyst to use its scoring mechanism and score the resume based on the questionnaire in one go.
+            """,
+            llm_config={"config_list": config_list, "max_tokens": 2000}
+        )
+
+        
+        # Resume analysis agent to analyze the resume
+        resume_analyst = autogen.AssistantAgent(
+            name="resume_analyst",
+            system_message="""
+            ## Task Overview
+            You are tasked with scoring resumes based on a provided questionnaire that assesses various aspects of a candidate's experience for a specific job position. Your goal is to evaluate each question in the questionnaire and calculate a final weighted score total.
+            """,
+            llm_config={"config_list": config_list, "max_tokens": 2000}
+        )
+
+        
+        # Simulate conversation (simplified for debug)
+        # In production, this would be a multi-turn chat
+        # For now, just call the ranking_tool directly with a dummy ranking
+        ranking = 0.85  # Dummy value for debug; replace with real scoring logic
+        conversation = "Sample conversation log here"  # Replace with real conversation
+        ranking_tool(candidate_email, ranking, conversation, resume)
+
+    except Exception as e:
+        print(f"[ERROR] Exception in initiate_chat for candidate_email {candidate_email}: {e}")
+        import traceback; traceback.print_exc()
+        return None
 
     # Use the job_questionnaire that is passed as an argument
     questionnaire = job_questionnaire
@@ -80,10 +197,18 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
             #     "resume": resume_safe,
             # }
 
-            # Save or update the ranking data in Cosmos DB using the new structure
-            save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conversation, resume)
-
-            return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
+            try:
+                # Debug print before saving
+                print(f"[DEBUG] About to save ranking for job_id={job_id}, candidate_email={candidate_email}")
+                print(f"[DEBUG] ranking_data: {json.dumps(ranking_data, indent=2)}")
+                print(f"[DEBUG] ranking: {ranking}")
+                result = save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conversation, resume)
+                print(f"[DEBUG] Result from save_ranking_data_to_cosmos_db: {result}")
+                return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
+            except Exception as e:
+                print(f"[ERROR] Exception in ranking_tool for candidate_email {candidate_email}: {e}")
+                import traceback; traceback.print_exc()
+                return None
 
         except Exception as e:
             print(f"An error occurred in the ranking tool: {e}")

@@ -1,6 +1,6 @@
 import yaml
-from common.database.cosmos.db_setup import setup_database
-from common.database.cosmos.db_operations import upsert_resume
+from neunet_ai_services.common.database.cosmos.db_setup import setup_database
+from neunet_ai_services.common.database.cosmos.db_operations import upsert_resume
 
 # Load configuration
 with open("config/config.yaml", 'r') as file:

@@ -26,10 +26,34 @@ A powerful backend service that handles job postings, candidate applications, an
 ### Data Validation
 - Pydantic (v2.4.2) - Data validation using Python type annotations
 
+## How to Run Backend Scripts
+
+- **Always run scripts from inside the `neunet_ai_services` directory using the `-m` flag:**
+  ```sh
+  cd /path/to/neunet_ai_services
+  python -m scripts.backfill_job_questionnaires
+  python -m scripts.generate_missing_questionnaires
+  python -m scripts.search_cynthia_cosmos
+  # ...and so on for any script in scripts/
+  ```
+- **To run the FastAPI server:**
+  ```sh
+  uvicorn services.api.main:app --reload
+  ```
+- **All imports should start with `services.` or `common.`**
+  ```python
+  from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+  from services.common.database.cosmos.db_operations import fetch_job_description
+  ```
+- **Never use the folder name `neunet_ai_services` in imports.**
+- This makes your backend fully portable and repo-name agnostic.
+
+---
+
 ## Project Structure
 
 ```
-neunet-ai-services/
+neunet_ai_services/
 ├── common/
 │   ├── database/
 │   │   └── cosmos/         # Cosmos DB operations
@@ -142,11 +166,11 @@ The application uses a YAML configuration file (`config/config.yaml`) for:
 - Deploy to [Render](https://render.com/) or your preferred cloud provider.
 - Set all required environment variables (DB credentials, API keys, etc.) in the Render dashboard.
 - Make sure your CORS settings in `services/api/main.py` include your deployed frontend domain (e.g., `https://neunet.io` or `https://www.neunet.io`).
-- After deployment, your API will be available at your Render URL (e.g., `https://neunet-ai-services.onrender.com`).
+- After deployment, your API will be available at your Render URL (e.g., `https://neunet_ai_services.onrender.com`).
 
 ## API Documentation
 
-- Interactive Swagger UI: `/docs` (e.g., `https://neunet-ai-services.onrender.com/docs`)
+- Interactive Swagger UI: `/docs` (e.g., `https://neunet_ai_services.onrender.com/docs`)
 - Redoc documentation: `/redoc`
 
 ## Notes

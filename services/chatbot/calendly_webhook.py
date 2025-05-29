@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from common.database.cosmos.db_operations import update_application_status
+from neunet_ai_services.common.database.cosmos.db_operations import update_application_status
 
 app = FastAPI()
 

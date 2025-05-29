@@ -4,9 +4,20 @@ import os
 import requests
 
 from dotenv import load_dotenv
+from pathlib import Path
 
-# Load environment variables from .env file in the project directory
-load_dotenv(dotenv_path=".env")
+# Always load the .env from the neunet_ai_services project root, regardless of where the server is started
+backend_root = Path(__file__).resolve().parent.parent.parent  # neunet_ai_services directory
+env_path = backend_root / ".env"
+print("[DEBUG] .env path:", env_path)
+print("[DEBUG] .env exists:", env_path.exists())
+load_dotenv(env_path)
+
+# DEBUG: Print loaded environment variables
+print("AZURE_OPENAI_API_KEY:", os.getenv("AZURE_OPENAI_API_KEY"))
+print("AZURE_OPENAI_ENDPOINT:", os.getenv("AZURE_OPENAI_ENDPOINT"))
+print("api_version:", os.getenv("api_version"))
+print("deployment_name:", os.getenv("deployment_name"))
 
 client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("api_version"))
 
@@ -55,9 +66,29 @@ def generate_description(data):
     return generated_description
 
 def load_prompt():
-    prompt_path = "services/prompts/generate_job_description.txt"
+    from pathlib import Path
+    def find_prompt_upwards(filename="prompts/generate_job_description.txt", start_path=None):
+        import os
+        if start_path is None:
+            start_path = Path(__file__).resolve().parent
+        current = start_path
+        while True:
+            candidate = current / filename
+            if candidate.exists():
+                return candidate
+            if current.parent == current:
+                break
+            current = current.parent
+        return None
+
+    prompt_path = find_prompt_upwards()
+    print("PROMPT PATH:", prompt_path)
+    print("PROMPT EXISTS:", prompt_path.exists() if prompt_path else False)
+    if not prompt_path:
+        raise FileNotFoundError("Could not find prompts/generate_job_description.txt upwards from " + str(Path(__file__).resolve().parent))
     with open(prompt_path, 'r') as file:
         return file.read()
+
 
 def check_missing_fields(data):
     required_fields = [

@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form
+print("=== LOADING main.py ===")
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
@@ -11,7 +12,7 @@ import sys
 # Add the project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from common.database.cosmos import db_operations
+from neunet_ai_services.common.database.cosmos import db_operations
 from azure.storage.blob import BlobServiceClient
 import io
 
@@ -21,9 +22,9 @@ app = FastAPI(title="Neunet Recruitment API")
 from fastapi import UploadFile, File
 import shutil
 import tempfile
-from services.resume_parser.parser.openai_resume_parser import parse_resume_json
-from services.resume_parser.parser.pdf_parser import parse_pdf
-from services.resume_parser.parser.doc_parser import parse_doc
+from neunet_ai_services.services.resume_parser.parser.openai_resume_parser import parse_resume_json
+from neunet_ai_services.services.resume_parser.parser.pdf_parser import parse_pdf
+from neunet_ai_services.services.resume_parser.parser.doc_parser import parse_doc
 
 @app.post("/api/parse-resume")
 async def parse_resume(file: UploadFile = File(...)):
@@ -124,7 +125,7 @@ async def list_jobs():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/")
-async def create_job(job: JobDescription):
+async def create_job(job: JobDescription, background_tasks: BackgroundTasks):
     try:
         # Generate a new 6-digit job ID if not provided
         if not job.job_id:
@@ -137,10 +138,46 @@ async def create_job(job: JobDescription):
         
         # Store in Cosmos DB
         db_operations.upsert_jobDetails(job_data)
+
+        # Trigger questionnaire generation as a background task
+        background_tasks.add_task(generate_and_store_questionnaire, job.job_id)
+
         return {"message": "Job created successfully", "job_id": job.job_id}
     except Exception as e:
         print(f"Error creating job: {e}")  # Debug log
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Background Task for Questionnaire Generation ---
+def generate_and_store_questionnaire(job_id):
+    try:
+        from neunet_ai_services.services.resume_ranking.job_description_questionnaire.jd_questionnaire_generator import generate_questionnaire
+        from neunet_ai_services.common.database.cosmos.db_operations import fetch_job_description, store_job_questionnaire, upsert_jobDetails
+        import json
+        import datetime
+        job_description = fetch_job_description(job_id)
+        if not job_description:
+            print(f"[ERROR] Could not fetch job description for job_id: {job_id}")
+            return
+        print(f"[INFO] Generating questionnaire for job_id: {job_id}")
+        raw_response = generate_questionnaire(job_description)
+        start_idx = raw_response.find("{")
+        end_idx = raw_response.rfind("}")
+        try:
+            json_data = json.loads(raw_response[start_idx:end_idx+1])
+        except Exception as e:
+            print(f"[ERROR] Failed to parse questionnaire JSON: {e}")
+            return
+        json_data['job_id'] = job_id
+        current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        unique_id = f"{job_id}_{current_time}"
+        json_data['id'] = unique_id
+        store_job_questionnaire(json_data)
+        # Optionally, attach questionnaire to job record
+        job_description['questionnaire'] = json_data
+        upsert_jobDetails(job_description)
+        print(f"[INFO] Questionnaire generated and stored for job_id: {job_id}")
+    except Exception as e:
+        print(f"[ERROR] Exception in background questionnaire generation: {e}")
 
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
@@ -150,16 +187,26 @@ async def get_job(job_id: str):
             raise HTTPException(status_code=404, detail="Job not found")
         return job
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/jobs/{job_id}/questionnaire")
 async def get_job_questionnaire(job_id: str):
     try:
         job = db_operations.fetch_job_description(job_id)
-        if not job or not job.get("questionnaire"):
-            raise HTTPException(status_code=404, detail="Questionnaire not found")
-        return job["questionnaire"]
+        if job and job.get("questionnaire"):
+            return job["questionnaire"]
+        # If not found in job document, look in jobDescriptionQuestionnaire container
+        questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+        if questionnaire_doc and questionnaire_doc.get("questionnaire"):
+            return questionnaire_doc["questionnaire"]
+        raise HTTPException(status_code=404, detail="Questionnaire not found")
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # Candidate Endpoints
@@ -171,6 +218,9 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
             return []
         return candidates
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/candidates/{candidate_id}")
@@ -180,21 +230,27 @@ async def get_candidate_by_id(candidate_id: str):
     candidate_id can be email or unique candidate id.
     """
     try:
-        # Fetch all applications for this candidate by candidate_id
-        applications = db_operations.fetch_applications_by_candidate(candidate_id)
-        # Fallback: if not found, try lookup by email
-        if not applications or len(applications) == 0:
-            applications = db_operations.fetch_applications_by_candidate_email(candidate_id)
-        if not applications or len(applications) == 0:
+        # Fetch all applications for this candidate by candidate_id and by email, merge and deduplicate
+        applications_by_id = db_operations.fetch_applications_by_candidate(candidate_id) or []
+        applications_by_email = db_operations.fetch_applications_by_candidate_email(candidate_id) or []
+        # Merge and deduplicate by (job_id, email)
+        seen = set()
+        all_applications = []
+        for app in applications_by_id + applications_by_email:
+            key = (app.get('job_id'), app.get('email'))
+            if key not in seen:
+                seen.add(key)
+                all_applications.append(app)
+        if not all_applications:
             raise HTTPException(status_code=404, detail="Candidate not found")
         # Profile fields from one application (assuming all have same candidate info)
         profile_fields = [
             'name', 'email', 'avatar', 'role', 'evaluation', 'github', 'skills', 'resume', 'resume_blob_name', 'cover_letter', 'ranking'
         ]
-        candidate_profile = {k: applications[0].get(k) for k in profile_fields if k in applications[0]}
+        candidate_profile = {k: all_applications[0].get(k) for k in profile_fields if k in all_applications[0]}
         # List of jobs applied to
         jobs_applied = []
-        for app in applications:
+        for app in all_applications:
             job_id = app.get('job_id')
             job_title = app.get('job_title')
             # Patch: Always fetch job title if missing
@@ -211,13 +267,24 @@ async def get_candidate_by_id(candidate_id: str):
                 'score': app.get('score') or app.get('ranking'),
             })
         candidate_profile['jobsApplied'] = jobs_applied
-        # Add parsed_resume details if available
-        if 'resume' in applications[0] and isinstance(applications[0]['resume'], dict):
-            candidate_profile['parsed_resume'] = applications[0]['resume']
+        # Add parsed_resume details if available (check both possible field names)
+        parsed_resume = None
+        if 'parsed_resume' in all_applications[0] and isinstance(all_applications[0]['parsed_resume'], dict):
+            parsed_resume = all_applications[0]['parsed_resume']
+            candidate_profile['parsed_resume'] = parsed_resume
+        elif 'resume' in all_applications[0] and isinstance(all_applications[0]['resume'], dict):
+            parsed_resume = all_applications[0]['resume']
+            candidate_profile['parsed_resume'] = parsed_resume
+        # Always set 'skills' from parsed_resume if available
+        if parsed_resume and parsed_resume.get('skills'):
+            candidate_profile['skills'] = parsed_resume['skills']
         # Add a unique candidate_id (use email for now if no id field)
-        candidate_profile['candidate_id'] = applications[0].get('candidate_id') or applications[0].get('email')
+        candidate_profile['candidate_id'] = all_applications[0].get('candidate_id') or all_applications[0].get('email')
         return candidate_profile
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/{job_id}/candidates/{candidate_email}/status")
@@ -226,6 +293,9 @@ async def update_candidate_status(job_id: str, candidate_email: str, status: str
         db_operations.update_application_status(job_id, candidate_email, status)
         return {"message": "Status updated successfully"}
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/candidates/{job_id}/{email}/resume")
@@ -248,6 +318,9 @@ async def get_candidate_resume(job_id: str, email: str):
             "Content-Disposition": f"attachment; filename={os.path.basename(blob_name)}"
         })
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # Application Endpoints
@@ -259,6 +332,9 @@ async def get_job_applications(job_id: str):
             return []
         return applications
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/{job_id}/apply")
@@ -267,8 +343,9 @@ async def apply_for_job(
     name: str = Form(...),
     email: str = Form(...),
     cover_letter: str = Form(None),
-    ranking: float = Form(0.85),
-    resume: UploadFile = File(...)
+    ranking: float = Form(0.85),  # Will be overwritten by actual ranking logic
+    resume: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
 ):
     try:
         # Defensive logging and checks
@@ -294,6 +371,7 @@ async def apply_for_job(
         blob_client.upload_blob(data, overwrite=True)
         # Parse the uploaded resume and store extracted info (github/linkedin/etc)
         parsed_resume = None
+        resume_blob_name = blob_name  # Always set
         try:
             # Save file to temp
             import tempfile
@@ -319,19 +397,136 @@ async def apply_for_job(
             except Exception:
                 pass
 
+        # --- Integrate Resume Ranking Logic ---
+        # Fetch job description and questionnaire
+        from neunet_ai_services.services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+        from neunet_ai_services.common.database.cosmos import db_operations
+        job_description = db_operations.fetch_job_description(job_id)
+        job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+        job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
+        questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
+        resume_text = text if 'text' in locals() else ''
+        job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
+        # Defensive: Only call ranking if all required fields are present
+        ranking_score = ranking
+        if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
+            try:
+                ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
+                # Try to extract a numeric score from the result (if possible)
+                if isinstance(ranking_result, dict) and 'score' in ranking_result:
+                    ranking_score = ranking_result['score']
+                elif isinstance(ranking_result, (int, float)):
+                    ranking_score = ranking_result
+                elif isinstance(ranking_result, str):
+                    import re
+                    match = re.search(r"([0-9]+\.?[0-9]*)", ranking_result)
+                    if match:
+                        ranking_score = float(match.group(1))
+            except Exception as e:
+                print(f"[WARN] Resume ranking logic failed: {e}")
+                ranking_score = ranking
+        else:
+            print("[WARN] Skipping ranking logic due to missing data.")
+
         application_data = {
             "id": f"{job_id}_{email}",
             "job_id": job_id,
             "name": name,
             "email": email,
             "cover_letter": cover_letter,
-            "ranking": ranking,
+            "ranking": ranking,  # Initial placeholder, will update after ranking
             "status": "applied",
             "applied_at": datetime.utcnow().isoformat(),
+            "resume_blob_name": resume_blob_name,
+            "parsed_resume": parsed_resume,
             "type": "candidate",
-            "resume_blob_name": blob_name,
-            "resume": parsed_resume if parsed_resume else None
         }
+        from neunet_ai_services.common.database.cosmos.db_operations import upsert_candidate
+        upsert_candidate(application_data)
+
+        # Trigger resume ranking as a background task
+        if background_tasks is not None:
+            background_tasks.add_task(rank_candidate_resume_task, job_id, email, resume_blob_name, parsed_resume)
+
+        return {"message": "Application submitted successfully. Ranking will be available soon."}
+    except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Background Task for Resume Ranking ---
+def rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume):
+    try:
+        from neunet_ai_services.services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+        from neunet_ai_services.common.database.cosmos import db_operations
+        job_description = db_operations.fetch_job_description(job_id)
+        job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+        job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
+        questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
+        # Download resume text from blob if needed (parsed_resume may be None)
+        resume_text = ''
+        if parsed_resume and isinstance(parsed_resume, dict) and 'raw_text' in parsed_resume:
+            resume_text = parsed_resume['raw_text']
+        else:
+            # Try to download and parse again if needed
+            try:
+                AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+                CONTAINER_NAME = "resumes"
+                from azure.storage.blob import BlobServiceClient
+                blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+                container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+                blob_client = container_client.get_blob_client(resume_blob_name)
+                stream = blob_client.download_blob().readall()
+                import tempfile
+                suffix = os.path.splitext(resume_blob_name)[-1].lower()
+                fd, temp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+                with open(temp_path, "wb") as out_file:
+                    out_file.write(stream)
+                if suffix == '.pdf':
+                    from neunet_ai_services.services.resume_parser.parser.pdf_parser import parse_pdf
+                    text, hyperlinks = parse_pdf(temp_path)
+                elif suffix in ['.doc', '.docx']:
+                    from neunet_ai_services.services.resume_parser.parser.doc_parser import parse_doc
+                    text, hyperlinks = parse_doc(temp_path)
+                else:
+                    text, hyperlinks = '', []
+                resume_text = text
+                os.remove(temp_path)
+            except Exception as e:
+                print(f"[WARN] Could not re-parse resume from blob: {e}")
+                resume_text = ''
+        job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
+        if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
+            try:
+                ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
+                ranking_score = None
+                if isinstance(ranking_result, dict) and 'score' in ranking_result:
+                    ranking_score = float(ranking_result['score'])
+                elif isinstance(ranking_result, (float, int)):
+                    ranking_score = float(ranking_result)
+                else:
+                    import re
+                    match = re.search(r"([0-9]+\.?[0-9]*)", str(ranking_result))
+                    if match:
+                        ranking_score = float(match.group(1))
+                if ranking_score is not None:
+                    # Update candidate record with new ranking
+                    candidate = db_operations.fetch_resume_with_email_and_job(job_id, email)
+                    if candidate:
+                        candidate['ranking'] = ranking_score
+                        db_operations.upsert_candidate(candidate)
+                        print(f"[INFO] Ranking updated for {email} in job {job_id}: {ranking_score}")
+            except Exception as e:
+                print(f"[WARN] Resume ranking logic failed in background: {e}")
+        else:
+            print(f"[WARN] Skipping ranking logic due to missing data for {email} in job {job_id}")
+    except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
+        print(f"[ERROR] Exception in background ranking task: {e}")
         db_operations.upsert_candidate(application_data)
         return {"message": "Application submitted successfully"}
     except HTTPException as e:
@@ -351,25 +546,37 @@ async def get_candidates_for_job(job_id: str):
 def generate_job_description(request: JobDescriptionRequest):
     from services.ai_job_description.generate_description import generate_description
     import json
+    import re
     try:
         data = request.dict()
         generated = generate_description(data)
-        # Clean and robustly parse the AI's response as JSON, even if double-encoded
         cleaned = generated.strip()
+        # Remove markdown/code block wrappers if present
         if cleaned.lower().startswith('json'):
             cleaned = cleaned.split('\n', 1)[-1]
         cleaned = cleaned.strip('`')
-        # Try to parse multiple times if necessary
-        for _ in range(3):
+        # Try to parse as JSON directly
+        try:
+            result = json.loads(cleaned)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+        # Try to extract first JSON object from the string using regex
+        match = re.search(r'({[\s\S]*})', cleaned)
+        if match:
             try:
-                cleaned = json.loads(cleaned)
+                result = json.loads(match.group(1))
+                if isinstance(result, dict):
+                    return result
             except Exception:
-                break
-            if isinstance(cleaned, dict):
-                return cleaned
-        # If parsing fails, return as a string
-        return {"job_description": generated}
+                pass
+        # If all parsing fails, raise an error
+        raise HTTPException(status_code=500, detail="AI did not return valid JSON. Please try again or check the prompt.")
     except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

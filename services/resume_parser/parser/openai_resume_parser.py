@@ -1,17 +1,73 @@
+import os
+print("=== LOADING openai_resume_parser.py ===")
+from pathlib import Path
+print("CWD:", os.getcwd())
+# Always resolve the .env path relative to this file's location
+# Find the .env file by traversing up from this script until found, to avoid hardcoding any folder names
+from dotenv import load_dotenv
+
+def find_dotenv_upwards(filename=".env", start_path=None):
+    import os
+    from pathlib import Path
+    if start_path is None:
+        start_path = Path(__file__).resolve().parent
+    current = start_path
+    while True:
+        candidate = current / filename
+        if candidate.exists():
+            return candidate
+        if current.parent == current:
+            break
+        current = current.parent
+    return None
+
+dotenv_path = find_dotenv_upwards()
+print("DOTENV PATH:", dotenv_path)
+print("ENV EXISTS:", os.path.exists(str(dotenv_path)) if dotenv_path else False)
+if dotenv_path:
+    load_dotenv(dotenv_path=dotenv_path)
+
+print("DOTENV PATH:", dotenv_path)
+print("ENV EXISTS:", os.path.exists(str(dotenv_path)))
+from dotenv import load_dotenv
+# Always load the .env from the neunet_ai_services directory, regardless of where server is started
+load_dotenv(dotenv_path=dotenv_path)
+
+# DEBUG: Print out loaded Azure OpenAI env vars (mask API key for safety)
+def _debug_env():
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_version = os.getenv("api_version")
+    deployment_name = os.getenv("deployment_name")
+    api_type = os.getenv("api_type")
+    def mask(val):
+        if not val: return None
+        if len(val) <= 8: return val
+        return f"{val[:4]}...{val[-4:]}"
+    print("[ENV DEBUG] AZURE_OPENAI_API_KEY:", mask(api_key))
+    print("[ENV DEBUG] AZURE_OPENAI_ENDPOINT:", endpoint)
+    print("[ENV DEBUG] api_version:", api_version)
+    print("[ENV DEBUG] deployment_name:", deployment_name)
+    print("[ENV DEBUG] api_type:", api_type)
+_debug_env()
+
 import openai
 from openai import AzureOpenAI
 import json
 
-import os
+def get_azure_openai_client():
+    # Load env and print debug info
+    dotenv_path = Path(__file__).parent.parent.parent / ".env"
+    load_dotenv(dotenv_path=dotenv_path)
+    _debug_env()
+    from openai import AzureOpenAI
+    return AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_version=os.getenv("api_version"),
+    )
 
-from dotenv import load_dotenv
-
-# Load environment variables from .env file in the project directory
-load_dotenv(dotenv_path=".env")
-
-client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("api_version"))
-
-model= os.getenv("deployment_name")
+model = os.getenv("deployment_name")
 
 def parse_resume_json(resume_text, links=None):
     if resume_text is None:
@@ -120,6 +176,7 @@ def parse_resume_json(resume_text, links=None):
     Provide the extracted information in JSON format. Return only the JSON string.
     """
 
+    client = get_azure_openai_client()
     response = client.chat.completions.create(
         model=model,
         messages=[

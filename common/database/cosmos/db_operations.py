@@ -32,9 +32,9 @@ def fetch_applications_by_candidate(candidate_id):
 
 # Fetch applications by candidate email (for fallback lookup)
 def fetch_applications_by_candidate_email(email):
-    global container  # Assumes container is initialized at module level
+    global containers, config
     query = f"SELECT * FROM c WHERE c.email = '{email}'"
-    return list(container.query_items(query=query, enable_cross_partition_query=True))
+    return list(containers[config['database']['application_container_name']].query_items(query=query, enable_cross_partition_query=True))
 
 # Initialize containers
 def ensure_containers():
@@ -110,14 +110,28 @@ def upsert_candidate(candidate_data):
     """
     Upsert a candidate application into the database.
     Adds a globally unique candidate_id if not present.
+    Ensures 'resume_blob_name' is present if a resume is uploaded.
+    Ensures candidate_id is consistent for all applications with the same email.
     """
     try:
         print(f"Upserting candidate application for job {candidate_data['job_id']}")
         print("Candidate data to upsert:", candidate_data)
-        # Generate candidate_id if not present
+        # Validate presence of resume_blob_name if a resume is uploaded
+        if candidate_data.get('resume_uploaded', True):  # Assume True if not specified
+            if not candidate_data.get('resume_blob_name'):
+                print(f"WARNING: Candidate {candidate_data.get('email')} for job {candidate_data.get('job_id')} is missing 'resume_blob_name'.")
+                raise ValueError(f"Missing 'resume_blob_name' for candidate {candidate_data.get('email')} and job {candidate_data.get('job_id')}")
+        # Ensure candidate_id is consistent for email
         if not candidate_data.get("candidate_id"):
-            candidate_data["candidate_id"] = str(uuid.uuid4())
-            print(f"Generated new candidate_id: {candidate_data['candidate_id']}")
+            # Look for existing applications for this email
+            existing_apps = fetch_applications_by_candidate_email(candidate_data["email"])
+            existing_cids = [app.get("candidate_id") for app in existing_apps if app.get("candidate_id")]
+            if existing_cids:
+                candidate_data["candidate_id"] = existing_cids[0]
+                print(f"Reusing candidate_id {candidate_data['candidate_id']} for email {candidate_data['email']}")
+            else:
+                candidate_data["candidate_id"] = str(uuid.uuid4())
+                print(f"Generated new candidate_id: {candidate_data['candidate_id']}")
         # Create composite ID from job_id and email
         candidate_data["id"] = f"{candidate_data['job_id']}_{candidate_data['email']}"
         containers[config['database']['application_container_name']].upsert_item(candidate_data)
@@ -293,7 +307,7 @@ def store_job_questionnaire(questionnaire_data):
 
 def fetch_job_description_questionnaire(job_id):
     try:
-        query = f"SELECT * FROM c WHERE c.type = 'job_questionnaire' AND c.job_id = {job_id}"
+        query = f"SELECT * FROM c WHERE c.type = 'job_questionnaire' AND c.job_id = '{job_id}'"
         results = list(containers[config['database']['job_description_questionnaire_container_name']].query_items(query=query, enable_cross_partition_query=True))
         if results:
             print(f"Job description questionnaire fetched successfully for job ID: {job_id}")
@@ -404,31 +418,77 @@ def create_application_for_job_id(job_id, job_questionnaire_id):
         return None
 
 def save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conversation, resume):
+    print("[DEBUG] Entered save_ranking_data_to_cosmos_db")
+    print(f"[DEBUG] Arguments: candidate_email={candidate_email}, ranking={ranking}, conversation={str(conversation)[:100]}, resume type={type(resume)}")
     try:
+        # --- Validation ---
+        if not candidate_email or not ranking_data.get('job_id'):
+            print(f"[ERROR] Missing candidate_email or job_id. Skipping save. candidate_email={candidate_email}, job_id={ranking_data.get('job_id')}")
+            return "Error: Missing candidate_email or job_id."
+        if ranking is None:
+            print(f"[ERROR] Ranking is None for candidate_email={candidate_email}, job_id={ranking_data.get('job_id')}. Skipping save.")
+            return "Error: Ranking is None."
+
+        # --- Save a flat ranking record for UI ---
+        flat_ranking_doc = {
+            "id": f"{ranking_data['job_id']}_{candidate_email}",
+            "type": "ranking",
+            "job_id": ranking_data['job_id'],
+            "candidate_email": candidate_email,
+            "ranking": ranking,
+            "ranked_at": datetime.utcnow().isoformat(),
+        }
+        try:
+            containers[config['database']['ranking_container_name']].upsert_item(flat_ranking_doc)
+            print(f"[DEBUG] Flat ranking doc upserted for UI: {flat_ranking_doc}")
+        except Exception as e:
+            print(f"[ERROR] Failed to upsert flat ranking doc for UI: {e}")
+
+        # --- Retain old logic for backward compatibility ---
         if "candidates" not in ranking_data:
+            print("[DEBUG] 'candidates' not in ranking_data, initializing empty list.")
             ranking_data["candidates"] = []
 
+        updated = False
         for candidate in ranking_data["candidates"]:
-            if candidate["email"].lower() == candidate_email.lower():  
-                return f"Error: The candidate with email {candidate_email} has already applied."
+            if candidate["email"].lower() == candidate_email.lower() and candidate.get("job_id") == ranking_data.get("job_id"):
+                print(f"[DEBUG] Updating existing candidate entry for {candidate_email}")
+                candidate["ranking"] = ranking
+                candidate["conversation"] = conversation
+                candidate["resume"] = resume
+                candidate["application_status"] = "Applied"
+                updated = True
+                break
+        print(f"[DEBUG] Candidate updated: {updated}")
 
-        new_candidate = {
-            "email": candidate_email,
-            "ranking": ranking,
-            "conversation": conversation,
-            "resume": resume,
-            "application_status": "Applied"
-        }
-        ranking_data["candidates"].append(new_candidate)
+        if not updated:
+            print(f"[DEBUG] Appending new candidate entry for {candidate_email}")
+            new_candidate = {
+                "email": candidate_email,
+                "job_id": ranking_data.get("job_id"),
+                "ranking": ranking,
+                "conversation": conversation,
+                "resume": resume,
+                "application_status": "Applied"
+            }
+            ranking_data["candidates"].append(new_candidate)
+        else:
+            print(f"[DEBUG] Did not append new candidate, already updated.")
 
         if "id" in ranking_data:
+            print(f"[DEBUG] About to write to Cosmos DB: id={ranking_data['id']} candidates_count={len(ranking_data['candidates'])}")
             containers[config['database']['ranking_container_name']].replace_item(item=ranking_data["id"], body=ranking_data)
-            print(f"Ranking data successfully updated in Cosmos DB for {candidate_email}.")
+            print(f"[DEBUG] Ranking data successfully updated in Cosmos DB for {candidate_email}.")
+            print("[DEBUG] Returning success message")
             return f"Success: The candidate with email {candidate_email} has been added."
         else:
+            print("[DEBUG] Error: No 'id' found in ranking_data, cannot update the document.")
+            print("[DEBUG] Returning error message")
             return "Error: No 'id' found in ranking_data, cannot update the document."
     except Exception as e:
-        print(f"An error occurred while saving ranking data: {e}")
+        print(f"[ERROR] An error occurred while saving ranking data: {e}")
+        import traceback; traceback.print_exc()
+        print("[DEBUG] Returning error message")
         return f"An error occurred: {e}"
 
 import re

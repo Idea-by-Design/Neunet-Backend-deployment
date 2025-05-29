@@ -7,7 +7,10 @@ import os
 from dotenv import load_dotenv
 
 # Load environment variables from .env file in the project directory
-load_dotenv(dotenv_path=".env")
+from pathlib import Path
+# Always load .env from backend root
+backend_root = Path(__file__).resolve().parent.parent.parent.parent
+load_dotenv(backend_root / ".env")
 
 client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("api_version"))
 
