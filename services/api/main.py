@@ -216,7 +216,18 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
         candidates = db_operations.fetch_top_k_candidates_by_count(job_id, top_k)
         if not candidates:
             return []
-        return candidates
+        patched_candidates = []
+        for cand in candidates:
+            # Defensive: try both 'parsed_resume' and 'resume' fields
+            resume = None
+            if 'parsed_resume' in cand and cand['parsed_resume']:
+                resume = cand['parsed_resume']
+            elif 'resume' in cand and cand['resume']:
+                resume = cand['resume']
+            cand = dict(cand)  # make a copy to avoid mutating DB object
+            cand['resume'] = resume
+            patched_candidates.append(cand)
+        return patched_candidates
     except Exception as e:
         import traceback
         print("=== EXCEPTION OCCURRED ===")
@@ -368,10 +379,17 @@ async def apply_for_job(
         if data is None or len(data) == 0:
             print("[ERROR] Resume file is empty.")
             raise HTTPException(status_code=400, detail="Resume file is empty.")
-        blob_client.upload_blob(data, overwrite=True)
+        try:
+            blob_client.upload_blob(data, overwrite=True)
+            resume_blob_name = blob_name
+        except Exception as upload_exc:
+            print(f"[ERROR] Resume upload to Azure failed: {upload_exc}")
+            resume_blob_name = None
         # Parse the uploaded resume and store extracted info (github/linkedin/etc)
         parsed_resume = None
-        resume_blob_name = blob_name  # Always set
+        # Only proceed if the upload was successful
+        if not resume_blob_name:
+            raise HTTPException(status_code=500, detail="Resume upload failed. Please try again.")
         try:
             # Save file to temp
             import tempfile
