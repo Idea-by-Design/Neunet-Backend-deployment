@@ -1,5 +1,5 @@
 
-from neunet_ai_services.common.database.cosmos.db_operations import fetch_candidates_with_github_links, store_github_analysis
+from common.database.cosmos.db_operations import fetch_candidates_with_github_links, store_github_analysis
 from services.github_analysis.analyze_github import analyze_github_profile
 
 

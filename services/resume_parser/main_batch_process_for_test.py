@@ -2,8 +2,8 @@ import os
 import yaml
 import json
 import time  # Import the time module for adding sleep
-from neunet_ai_services.common.database.cosmos.db_setup import setup_database
-from neunet_ai_services.common.database.cosmos.db_operations import upsert_resume
+from common.database.cosmos.db_setup import setup_database
+from common.database.cosmos.db_operations import upsert_resume
 from services.resume_parser.parser.openai_resume_parser import parse_resume_json
 from services.resume_parser.parser.doc_parser import parse_doc
 from services.resume_parser.parser.pdf_parser import parse_pdf

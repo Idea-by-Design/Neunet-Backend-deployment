@@ -1,8 +1,8 @@
 import os
 import yaml
 import json
-from neunet_ai_services.common.database.cosmos.db_setup import setup_database
-from neunet_ai_services.common.database.cosmos.db_operations import upsert_jobDetails,fetch_job_description
+from common.database.cosmos.db_setup import setup_database
+from common.database.cosmos.db_operations import upsert_jobDetails,fetch_job_description
 from services.resume_parser.parser.openai_resume_parser import parse_resume_json
 from services.resume_parser.parser.doc_parser import parse_doc
 from services.resume_parser.parser.pdf_parser import parse_pdf

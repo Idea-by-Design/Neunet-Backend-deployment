@@ -1,5 +1,5 @@
 import logging
-from neunet_ai_services.common.database.cosmos.db_operations import containers, config
+from common.database.cosmos.db_operations import containers, config
 from azure.cosmos import exceptions
 
 def audit_candidates_missing_resume_blob():

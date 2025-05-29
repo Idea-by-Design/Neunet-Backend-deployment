@@ -1,6 +1,6 @@
 import autogen
 import os
-from neunet_ai_services.common.database.cosmos.db_operations import fetch_top_k_candidates_by_count, fetch_top_k_candidates_by_percentage, update_application_status, execute_sql_query
+from common.database.cosmos.db_operations import fetch_top_k_candidates_by_count, fetch_top_k_candidates_by_percentage, update_application_status, execute_sql_query
 from services.chatbot.functions import send_email
 from ..prompts.multiagent_assistant_prompts import  executor_agent_system_message, fetcher_agent_system_message, email_agent_system_message, job_desc_creator_system_message, sql_query_generator_system_message, initiate_chat_system_message
 from dotenv import load_dotenv

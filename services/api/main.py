@@ -12,7 +12,7 @@ import sys
 # Add the project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from neunet_ai_services.common.database.cosmos import db_operations
+from common.database.cosmos import db_operations
 from azure.storage.blob import BlobServiceClient
 import io
 
@@ -22,9 +22,9 @@ app = FastAPI(title="Neunet Recruitment API")
 from fastapi import UploadFile, File
 import shutil
 import tempfile
-from neunet_ai_services.services.resume_parser.parser.openai_resume_parser import parse_resume_json
-from neunet_ai_services.services.resume_parser.parser.pdf_parser import parse_pdf
-from neunet_ai_services.services.resume_parser.parser.doc_parser import parse_doc
+from services.resume_parser.parser.openai_resume_parser import parse_resume_json
+from services.resume_parser.parser.pdf_parser import parse_pdf
+from services.resume_parser.parser.doc_parser import parse_doc
 
 @app.post("/api/parse-resume")
 async def parse_resume(file: UploadFile = File(...)):
@@ -150,8 +150,8 @@ async def create_job(job: JobDescription, background_tasks: BackgroundTasks):
 # --- Background Task for Questionnaire Generation ---
 def generate_and_store_questionnaire(job_id):
     try:
-        from neunet_ai_services.services.resume_ranking.job_description_questionnaire.jd_questionnaire_generator import generate_questionnaire
-        from neunet_ai_services.common.database.cosmos.db_operations import fetch_job_description, store_job_questionnaire, upsert_jobDetails
+        from services.resume_ranking.job_description_questionnaire.jd_questionnaire_generator import generate_questionnaire
+        from common.database.cosmos.db_operations import fetch_job_description, store_job_questionnaire, upsert_jobDetails
         import json
         import datetime
         job_description = fetch_job_description(job_id)
@@ -399,8 +399,8 @@ async def apply_for_job(
 
         # --- Integrate Resume Ranking Logic ---
         # Fetch job description and questionnaire
-        from neunet_ai_services.services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
-        from neunet_ai_services.common.database.cosmos import db_operations
+        from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+        from common.database.cosmos import db_operations
         job_description = db_operations.fetch_job_description(job_id)
         job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
         job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
@@ -441,7 +441,7 @@ async def apply_for_job(
             "parsed_resume": parsed_resume,
             "type": "candidate",
         }
-        from neunet_ai_services.common.database.cosmos.db_operations import upsert_candidate
+        from common.database.cosmos.db_operations import upsert_candidate
         upsert_candidate(application_data)
 
         # Trigger resume ranking as a background task
@@ -458,8 +458,8 @@ async def apply_for_job(
 # --- Background Task for Resume Ranking ---
 def rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume):
     try:
-        from neunet_ai_services.services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
-        from neunet_ai_services.common.database.cosmos import db_operations
+        from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+        from common.database.cosmos import db_operations
         job_description = db_operations.fetch_job_description(job_id)
         job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
         job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
@@ -485,10 +485,10 @@ def rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume):
                 with open(temp_path, "wb") as out_file:
                     out_file.write(stream)
                 if suffix == '.pdf':
-                    from neunet_ai_services.services.resume_parser.parser.pdf_parser import parse_pdf
+                    from services.resume_parser.parser.pdf_parser import parse_pdf
                     text, hyperlinks = parse_pdf(temp_path)
                 elif suffix in ['.doc', '.docx']:
-                    from neunet_ai_services.services.resume_parser.parser.doc_parser import parse_doc
+                    from services.resume_parser.parser.doc_parser import parse_doc
                     text, hyperlinks = parse_doc(temp_path)
                 else:
                     text, hyperlinks = '', []
