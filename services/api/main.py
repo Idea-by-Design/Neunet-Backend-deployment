@@ -56,7 +56,13 @@ async def parse_resume(file: UploadFile = File(...)):
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.neunet.io", "http://localhost:8000"],  # Only allow production and local dev
+    allow_origins=[
+        "https://www.neunet.io",      # Production frontend
+        "http://localhost:3000",      # React dev server
+        "http://localhost:5173",      # Vite dev server
+        "http://localhost:8000",      # FastAPI local (if needed)
+    ],  # Allow production and local dev
+
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
