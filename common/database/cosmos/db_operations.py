@@ -217,8 +217,10 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
             enable_cross_partition_query=True
         ))
         
-        print(f"Found {len(candidates)} candidates for job {job_id}")
-        return candidates
+        # Filter out incomplete candidates (missing resume_blob_name)
+        valid_candidates = [c for c in candidates if c.get('resume_blob_name')]
+        print(f"Found {len(valid_candidates)} valid candidates for job {job_id}")
+        return valid_candidates
         
     except Exception as e:
         print(f"An error occurred while fetching candidates: {e}")
