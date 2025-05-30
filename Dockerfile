@@ -25,4 +25,4 @@ EXPOSE 8000
 ENV PORT=8000
 
 # Start FastAPI with Gunicorn
-CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "services.api.main:app", "--bind", "0.0.0.0:8000", "--workers", "1"]
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "services.api.main:app", "--bind", "0.0.0.0:8000", "--workers", "1", "--timeout", "120"]
