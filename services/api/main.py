@@ -223,7 +223,7 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
         if not candidates:
             return []
         # Fetch all rankings for this job in one go
-        rankings_map = { (k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
+        rankings_map = { (job_id, k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
         print(f"[DEBUG] rankings_map for job {job_id}: {rankings_map}")
         patched_candidates = []
         for cand in candidates:
@@ -237,15 +237,18 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
             # Normalize email for lookup
             email = (cand.get('email') or '').strip().lower()
             print(f"[DEBUG] Checking candidate email: {email}")
-            if email and email in rankings_map:
-                raw_ranking = rankings_map[email]['ranking']
-                # Normalize: if 0 < ranking <= 1, treat as normalized float, else use as-is
+            if email and (job_id, email) in rankings_map:
+                # Always pick ranking and explanation directly from ranking container
+                raw_ranking = rankings_map[(job_id, email)].get('ranking', 0)
+                explanation = rankings_map[(job_id, email)].get('explanation', None)
                 if isinstance(raw_ranking, (float, int)) and 0 < raw_ranking <= 1:
                     cand['ranking'] = round(raw_ranking * 100)
                 else:
                     cand['ranking'] = round(raw_ranking)
+                cand['explanation'] = explanation
             else:
                 cand['ranking'] = 0
+                cand['explanation'] = None
             patched_candidates.append(cand)
         return patched_candidates
     except Exception as e:
@@ -279,15 +282,6 @@ async def get_candidate_by_id(candidate_id: str):
             'name', 'email', 'avatar', 'role', 'evaluation', 'github', 'skills', 'resume', 'resume_blob_name', 'cover_letter', 'ranking'
         ]
         candidate_profile = {k: all_applications[0].get(k) for k in profile_fields if k in all_applications[0]}
-        # Fetch all rankings for this candidate (across all jobs)
-        rankings_map = {}
-        for app in all_applications:
-            job_id = app.get('job_id')
-            email = app.get('email')
-            if job_id and email:
-                rmap = db_operations.fetch_candidate_rankings(job_id)
-                if email in rmap:
-                    rankings_map[(job_id, email)] = rmap[email]['ranking']
         # List of jobs applied to
         jobs_applied = []
         for app in all_applications:
@@ -298,14 +292,21 @@ async def get_candidate_by_id(candidate_id: str):
             if not job_title and job_id:
                 job_desc = db_operations.fetch_job_description(job_id)
                 job_title = job_desc['title'] if job_desc and 'title' in job_desc else job_id
-            # Use ranking from ranking container if available
-            ranking = rankings_map.get((job_id, email), 0.0)
+            # Fetch ranking and explanation from ranking container
+            ranking = 0.0
+            explanation = None
+            if job_id and email:
+                rmap = db_operations.fetch_candidate_rankings(job_id)
+                if email in rmap:
+                    ranking = rmap[email].get('ranking', 0.0)
+                    explanation = rmap[email].get('explanation')
             jobs_applied.append({
                 'job_id': job_id,
                 'title': job_title,
                 'status': app.get('status'),
                 'applied_at': app.get('applied_at'),
                 'ranking': ranking,
+                'explanation': explanation,
                 'resume_blob_name': app.get('resume_blob_name'),
                 'score': app.get('score') or ranking,
             })

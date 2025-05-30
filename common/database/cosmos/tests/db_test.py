@@ -1,17 +1,22 @@
-import yaml
-from neunet_ai_services.common.database.cosmos.db_setup import setup_database
-from neunet_ai_services.common.database.cosmos.db_operations import upsert_resume
+from dotenv import load_dotenv
+import os
+from common.database.cosmos.db_setup import setup_database
+from common.database.cosmos.db_operations import upsert_resume
 
-# Load configuration
-with open("config/config.yaml", 'r') as file:
-    config = yaml.safe_load(file)
+# Load environment variables from .env at project root
+load_dotenv(os.path.join(os.path.dirname(__file__), '../../../../.env'))
 
-# Setup database connection
+# Setup database connection using environment variables
+COSMOS_DB_URI = os.environ['COSMOS_DB_URI']
+COSMOS_DB_KEY = os.environ['COSMOS_DB_KEY']
+COSMOS_DB_NAME = os.environ['COSMOS_DB_NAME']
+APPLICATION_CONTAINER_NAME = os.environ['APPLICATION_CONTAINER_NAME']
+
 _, container = setup_database(
-    config['database']['cosmos_db_uri'],
-    config['database']['cosmos_db_key'],
-    config['database']['cosmos_db_name'],
-    config['database']['container_name']
+    COSMOS_DB_URI,
+    COSMOS_DB_KEY,
+    COSMOS_DB_NAME,
+    APPLICATION_CONTAINER_NAME
 )
 
 # Sample data
@@ -22,4 +27,4 @@ sample_resume = {
 }
 
 # Upsert sample data
-upsert_resume(container, sample_resume)
+upsert_resume(sample_resume)

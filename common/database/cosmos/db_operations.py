@@ -273,7 +273,7 @@ def fetch_github_analysis(email):
         print(f"An error occurred while fetching GitHub analysis: {e}")
         return None
 
-def store_candidate_ranking(job_id, candidate_email, ranking):
+def store_candidate_ranking(job_id, candidate_email, ranking, explanation=None):
     try:
         ranking_data = {
             "id": f"{job_id}_{candidate_email}",
@@ -283,6 +283,8 @@ def store_candidate_ranking(job_id, candidate_email, ranking):
             "ranked_at": datetime.utcnow().isoformat(),
             "type": "ranking"
         }
+        if explanation is not None:
+            ranking_data["explanation"] = explanation
         containers[config['database']['ranking_container_name']].upsert_item(ranking_data)
         print(f"Ranking stored successfully for job {job_id} and candidate {candidate_email}")
     except exceptions.CosmosHttpResponseError as e:
@@ -290,9 +292,14 @@ def store_candidate_ranking(job_id, candidate_email, ranking):
 
 def fetch_candidate_rankings(job_id):
     try:
-        query = f"SELECT c.candidate_email, c.ranking, c.ranked_at FROM c WHERE c.type = 'ranking' AND c.job_id = '{job_id}'"
+        # Include explanation in the query and returned data
+        query = f"SELECT c.candidate_email, c.ranking, c.ranked_at, c.explanation FROM c WHERE c.type = 'ranking' AND c.job_id = '{job_id}'"
         rankings = list(containers[config['database']['ranking_container_name']].query_items(query=query, enable_cross_partition_query=True))
-        return {r['candidate_email']: {'ranking': r['ranking'], 'ranked_at': r['ranked_at']} for r in rankings}
+        return {r['candidate_email']: {
+            'ranking': r['ranking'],
+            'ranked_at': r['ranked_at'],
+            'explanation': r.get('explanation', None)
+        } for r in rankings}
     except Exception as e:
         print(f"An error occurred while fetching candidate rankings: {e}")
         return {}

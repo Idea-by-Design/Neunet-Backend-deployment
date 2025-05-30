@@ -2,7 +2,7 @@ import autogen
 import os
 import uuid
 import json
-from common.database.cosmos.db_operations import fetch_application_by_job_id, create_application_for_job_id, save_ranking_data_to_cosmos_db
+from common.database.cosmos.db_operations import fetch_application_by_job_id, create_application_for_job_id, store_candidate_ranking
 from dotenv import load_dotenv
 
 # Load environment variables from .env file in the project directory
@@ -60,7 +60,7 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                 return None
 
         # Ranking tool function
-        def ranking_tool(candidate_email, ranking, conversation, resume):
+        def ranking_tool(candidate_email, ranking, conversation, resume, explanation=None):
             print(f"[DEBUG] Entered ranking_tool for candidate_email={candidate_email}, ranking={ranking}")
             try:
                 # Sanitize all inputs to avoid JSON errors
@@ -73,31 +73,20 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                     print("[DEBUG] Returning early from ranking_tool due to payload error.")
                     return "Payload creation failed due to special characters."
 
-                # Fetch the application data from Cosmos DB using job_id
-                ranking_data = fetch_application_by_job_id(job_id)
-
-                # If no ranking data is found, create a new application
-                if not ranking_data:
-                    print(f"[DEBUG] No ranking_data found for job_id={job_id}, creating new application.")
-                    ranking_data = create_application_for_job_id(job_id, job_questionnaire_id)
-
-                # Generate a unique ID for the ranking entry (using job_id and job_questionnaire_id)
-                unique_id = f"{job_id}_{job_questionnaire_id}_{str(uuid.uuid4())}"
-
+                # Store the ranking record with explanation using the correct function
                 try:
-                    # Debug print before saving
-                    print(f"[DEBUG] About to call save_ranking_data_to_cosmos_db for job_id={job_id}, candidate_email={candidate_email}")
-                    print(f"[DEBUG] ranking_data: {json.dumps(ranking_data, indent=2)}")
+                    print(f"[DEBUG] About to call store_candidate_ranking for job_id={job_id}, candidate_email={candidate_email}")
                     print(f"[DEBUG] ranking: {ranking}")
-                    result = save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conversation, resume)
-                    print(f"[DEBUG] Result from save_ranking_data_to_cosmos_db: {result}")
-                    print("[DEBUG] Returning success from ranking_tool")
-                    return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
+                    print(f"[DEBUG] explanation: {explanation}")
+                    store_candidate_ranking(job_id, candidate_email, ranking, explanation)
+                    print("[DEBUG] Ranking stored successfully with explanation.")
                 except Exception as e:
-                    print(f"[ERROR] Exception in ranking_tool for candidate_email {candidate_email}: {e}")
+                    print(f"[ERROR] Exception in store_candidate_ranking for candidate_email {candidate_email}: {e}")
                     import traceback; traceback.print_exc()
                     print("[DEBUG] Returning error from ranking_tool due to exception.")
                     return None
+
+                return f"Ranking entry saved for candidate email: {candidate_email_safe} with explanation."
 
             except Exception as e:
                 print(f"[ERROR] An error occurred in the ranking tool: {e}")
@@ -158,9 +147,10 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                     "candidate_email": {"type": "string", "description": "The email of the candidate"},
                     "ranking": {"type": "number", "description": "The ranking value"},
                     "conversation": {"type": "string", "description": "The complete output of resume analyst before giving to score calculator analyst."},
-                    "resume": {"type": "string", "description": "The resume"}
+                    "resume": {"type": "string", "description": "The resume"},
+                    "explanation": {"type": "string", "description": "Short explanation for the ranking value"}
                 },
-                "required": ["candidate_email", "ranking", "conversation", "resume"]
+                "required": ["candidate_email", "ranking", "conversation", "resume", "explanation"]
             }
         }
         ranking_agent = autogen.AssistantAgent(
@@ -395,9 +385,10 @@ Make sure every calculation and validation is done carefully to avoid any incorr
                 "candidate_email": {"type": "string", "description": "The email of the candidate"},
                 "ranking": {"type": "number", "description": "The ranking value"},
                 "conversation": {"type": "string", "description": "The complete output of resume analyst before giving to score calculator analyst."},
-                "resume": {"type": "string", "description": "The resume"}
+                "resume": {"type": "string", "description": "The resume"},
+                "explanation": {"type": "string", "description": "Short explanation for the ranking value"}
             },
-            "required": ["candidate_email", "ranking", "conversation", "resume"]
+            "required": ["candidate_email", "ranking", "conversation", "resume", "explanation"]
         }
     }
 
