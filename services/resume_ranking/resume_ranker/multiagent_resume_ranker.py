@@ -78,6 +78,9 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                     print(f"[DEBUG] About to call store_candidate_ranking for job_id={job_id}, candidate_email={candidate_email}")
                     print(f"[DEBUG] ranking: {ranking}")
                     print(f"[DEBUG] explanation: {explanation}")
+                    if not explanation or not isinstance(explanation, str) or not explanation.strip():
+                        print(f"[ERROR] Missing or empty explanation for candidate_email={candidate_email}, ranking={ranking}")
+                        raise ValueError("Explanation for ranking must not be empty.")
                     store_candidate_ranking(job_id, candidate_email, ranking, explanation)
                     print("[DEBUG] Ranking stored successfully with explanation.")
                 except Exception as e:
@@ -233,7 +236,7 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                 print(f"[DEBUG] About to save ranking for job_id={job_id}, candidate_email={candidate_email}")
                 print(f"[DEBUG] ranking_data: {json.dumps(ranking_data, indent=2)}")
                 print(f"[DEBUG] ranking: {ranking}")
-                result = save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conversation, resume)
+                store_candidate_ranking(job_id, candidate_email, ranking, explanation)
                 print(f"[DEBUG] Result from save_ranking_data_to_cosmos_db: {result}")
                 return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
             except Exception as e:
@@ -314,19 +317,19 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                                                                     {
                                                                         "question": " <the question as mentioned in questionnaire>",
                                                                         "weight": <the weight of question>,
-                                                                        "scoring": " <Your score for this question>"
+                                                                        "scoring": " <Your score for this question>",
                                                                         "reasoning": " <Your reasoning for the score with relevant resume points>"
                                                                     }
                                                                     
                                                                                  
                                                                     Once you complete your task, give the questionnaire output to score_calculator_analyst agent and it to calculate the final score.
                                                                     """,
-                                            llm_config={"config_list": config_list, 
-                                                        "max_tokens": 4096})
-
+                                                    llm_config={"config_list": config_list, 
+                                                                "max_tokens": 2000})
     
-    # Job description analysis agent to analyze the job description and refer to the questionnaire
-    score_calculator_analyst = autogen.AssistantAgent(name="score_calculator_analyst", system_message = f"""
+    score_calculator_analyst = autogen.AssistantAgent(
+        name="score_calculator_analyst",
+        system_message = """
 Your task is to accurately calculate the final weighted and normalized score from the questionnaire responses.
 
 1. **Input Validation**:
@@ -372,8 +375,8 @@ Calculation steps:
 
 Make sure every calculation and validation is done carefully to avoid any incorrect results.
 """,
-                                                    llm_config={"config_list": config_list, 
-                                                                "max_tokens": 2000})
+        llm_config={"config_list": config_list, "max_tokens": 2000}
+    )
     
     # Ranking tool declaration
     ranking_tool_declaration = {

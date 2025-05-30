@@ -283,7 +283,9 @@ def store_candidate_ranking(job_id, candidate_email, ranking, explanation=None):
             "ranked_at": datetime.utcnow().isoformat(),
             "type": "ranking"
         }
-        if explanation is not None:
+        if not explanation or not isinstance(explanation, str) or not explanation.strip():
+            print(f"[WARNING] store_candidate_ranking called with missing or empty explanation for job_id={job_id}, candidate_email={candidate_email}")
+        else:
             ranking_data["explanation"] = explanation
         containers[config['database']['ranking_container_name']].upsert_item(ranking_data)
         print(f"Ranking stored successfully for job {job_id} and candidate {candidate_email}")
