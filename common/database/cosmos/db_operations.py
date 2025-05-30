@@ -476,13 +476,13 @@ def save_ranking_data_to_cosmos_db(ranking_data, candidate_email, ranking, conve
             print(f"[DEBUG] Did not append new candidate, already updated.")
 
         if "id" in ranking_data:
-            print(f"[DEBUG] About to write to Cosmos DB: id={ranking_data['id']} candidates_count={len(ranking_data['candidates'])}")
-            containers[config['database']['ranking_container_name']].replace_item(item=ranking_data["id"], body=ranking_data)
-            print(f"[DEBUG] Ranking data successfully updated in Cosmos DB for {candidate_email}.")
+            print(f"[DEBUG] About to upsert to Cosmos DB: id={ranking_data['id']} candidates_count={len(ranking_data['candidates'])}")
+            containers[config['database']['ranking_container_name']].upsert_item(ranking_data)
+            print(f"[DEBUG] Ranking data successfully upserted in Cosmos DB for {candidate_email}.")
             print("[DEBUG] Returning success message")
             return f"Success: The candidate with email {candidate_email} has been added."
         else:
-            print("[DEBUG] Error: No 'id' found in ranking_data, cannot update the document.")
+            print(f"[DEBUG] Error: No 'id' found in ranking_data, cannot update the document.")
             print("[DEBUG] Returning error message")
             return "Error: No 'id' found in ranking_data, cannot update the document."
     except Exception as e:

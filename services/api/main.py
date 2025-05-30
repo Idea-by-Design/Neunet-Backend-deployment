@@ -100,7 +100,7 @@ class CandidateApplication(BaseModel):
     email: str
     resume: str
     cover_letter: Optional[str] = None
-    ranking: float = Field(default=0.85)  # For testing, we'll set a default ranking
+    ranking: float = Field(default=0.0)  # For testing, we'll set a default ranking
 
 class JobDescriptionRequest(BaseModel):
     title: str = None
@@ -216,16 +216,23 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
         candidates = db_operations.fetch_top_k_candidates_by_count(job_id, top_k)
         if not candidates:
             return []
+        # Fetch all rankings for this job in one go
+        rankings_map = db_operations.fetch_candidate_rankings(job_id)
         patched_candidates = []
         for cand in candidates:
-            # Defensive: try both 'parsed_resume' and 'resume' fields
             resume = None
             if 'parsed_resume' in cand and cand['parsed_resume']:
                 resume = cand['parsed_resume']
             elif 'resume' in cand and cand['resume']:
                 resume = cand['resume']
-            cand = dict(cand)  # make a copy to avoid mutating DB object
+            cand = dict(cand)
             cand['resume'] = resume
+            # Set ranking from ranking container if available
+            email = cand.get('email')
+            if email and email in rankings_map:
+                cand['ranking'] = rankings_map[email]['ranking']
+            else:
+                cand['ranking'] = 0.0
             patched_candidates.append(cand)
         return patched_candidates
     except Exception as e:
@@ -259,25 +266,39 @@ async def get_candidate_by_id(candidate_id: str):
             'name', 'email', 'avatar', 'role', 'evaluation', 'github', 'skills', 'resume', 'resume_blob_name', 'cover_letter', 'ranking'
         ]
         candidate_profile = {k: all_applications[0].get(k) for k in profile_fields if k in all_applications[0]}
+        # Fetch all rankings for this candidate (across all jobs)
+        rankings_map = {}
+        for app in all_applications:
+            job_id = app.get('job_id')
+            email = app.get('email')
+            if job_id and email:
+                rmap = db_operations.fetch_candidate_rankings(job_id)
+                if email in rmap:
+                    rankings_map[(job_id, email)] = rmap[email]['ranking']
         # List of jobs applied to
         jobs_applied = []
         for app in all_applications:
             job_id = app.get('job_id')
             job_title = app.get('job_title')
+            email = app.get('email')
             # Patch: Always fetch job title if missing
             if not job_title and job_id:
                 job_desc = db_operations.fetch_job_description(job_id)
                 job_title = job_desc['title'] if job_desc and 'title' in job_desc else job_id
+            # Use ranking from ranking container if available
+            ranking = rankings_map.get((job_id, email), 0.0)
             jobs_applied.append({
                 'job_id': job_id,
                 'title': job_title,
                 'status': app.get('status'),
                 'applied_at': app.get('applied_at'),
-                'ranking': app.get('ranking'),
+                'ranking': ranking,
                 'resume_blob_name': app.get('resume_blob_name'),
-                'score': app.get('score') or app.get('ranking'),
+                'score': app.get('score') or ranking,
             })
         candidate_profile['jobsApplied'] = jobs_applied
+        # Set profile ranking as highest ranking across jobs (or 0)
+        candidate_profile['ranking'] = max([j['ranking'] for j in jobs_applied] or [0.0])
         # Add parsed_resume details if available (check both possible field names)
         parsed_resume = None
         if 'parsed_resume' in all_applications[0] and isinstance(all_applications[0]['parsed_resume'], dict):
@@ -354,7 +375,7 @@ async def apply_for_job(
     name: str = Form(...),
     email: str = Form(...),
     cover_letter: str = Form(None),
-    ranking: float = Form(0.85),  # Will be overwritten by actual ranking logic
+    ranking: float = Form(0.0),  # Will be overwritten by actual ranking logic
     resume: UploadFile = File(...),
     background_tasks: BackgroundTasks = None
 ):

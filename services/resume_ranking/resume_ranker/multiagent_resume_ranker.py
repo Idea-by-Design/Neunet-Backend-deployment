@@ -37,7 +37,7 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
         else:
             print(f"[DEBUG] [initiate_chat] Resume is not a string. Value: {repr(resume)}")
         # Validate resume
-        if not resume or not isinstance(resume, str) or resume.strip() == "":
+        if not resume or (isinstance(resume, str) and resume.strip() == ""):
             logging.warning(f"[RANKING] Skipping ranking for {candidate_email}: Resume is missing or invalid.")
             print(f"[DEBUG] [initiate_chat] Skipping ranking for {candidate_email}: Resume is missing or invalid.")
             return None
@@ -135,12 +135,53 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
         )
 
         
-        # Simulate conversation (simplified for debug)
-        # In production, this would be a multi-turn chat
-        # For now, just call the ranking_tool directly with a dummy ranking
-        ranking = 0.85  # Dummy value for debug; replace with real scoring logic
-        conversation = "Sample conversation log here"  # Replace with real conversation
-        ranking_tool(candidate_email, ranking, conversation, resume)
+        # --- Start group chat for real scoring ---
+        # Set up the additional agents (score calculator and ranking agent)
+        score_calculator_analyst = autogen.AssistantAgent(
+            name="score_calculator_analyst",
+            system_message="""
+            You are the score calculator analyst. Your job is to take the output from the resume analyst (which includes per-question scores and weights), validate all values, and compute a final weighted score as follows:\n
+            1. For each question, multiply the score by its weight.\n
+            2. Sum all weighted scores to get the candidate's total score.\n
+            3. Sum all possible maximum scores (max_score * weight) to get the total possible score.\n
+            4. Normalize: final_score = candidate_total_score / total_possible_score.\n
+            5. Output the final_score as a float between 0 and 1, with a short explanation.\n            """,
+            llm_config={"config_list": config_list, "max_tokens": 2000}
+        )
+
+        ranking_tool_declaration = {
+            "name": "ranking_tool",
+            "description": "Provides a ranking based on the calculation given by score_calculator_analyst.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_email": {"type": "string", "description": "The email of the candidate"},
+                    "ranking": {"type": "number", "description": "The ranking value"},
+                    "conversation": {"type": "string", "description": "The complete output of resume analyst before giving to score calculator analyst."},
+                    "resume": {"type": "string", "description": "The resume"}
+                },
+                "required": ["candidate_email", "ranking", "conversation", "resume"]
+            }
+        }
+        ranking_agent = autogen.AssistantAgent(
+            name="ranking_agent",
+            system_message="As the ranking agent, you provide a ranking based on the scoring provided by score_calculator_analyst.",
+            llm_config={"config_list": config_list, "max_tokens": 4096, "functions": [ranking_tool_declaration]}
+        )
+
+        group_chat = autogen.GroupChat(
+            agents=[user_proxy, job_description_analyst, resume_analyst, score_calculator_analyst, ranking_agent],
+            messages=[]
+        )
+        group_chat_manager = autogen.GroupChatManager(groupchat=group_chat, llm_config={"config_list": config_list})
+
+        # Start the group chat
+        user_proxy.initiate_chat(
+            group_chat_manager,
+            message=f"""Process overview:\n\n1. Job description analyst will show the complete questionnaire to resume analyst as provided in its instructions.\n2. Resume analyst analyzes the resume and scores all questions at once in one go as provided in its instructions.\n3. Score calculator analyst calculates the final weighted score total by aggregating the scores from all sections as provided in its instructions.\n4. Ranking agent provides a ranking based on the responses as provided in its instructions.\n\nJob Description: {job_description}\n\nHere is the Candidate information\nCandidate mail: {candidate_email}\nResume: {resume}\n"""
+        )
+        # NOTE: The ranking_tool will be called by the ranking agent with the actual score and conversation log.
+        # No need to call ranking_tool manually here; it will be invoked by the agent with real data.
 
     except Exception as e:
         print(f"[ERROR] Exception in initiate_chat for candidate_email {candidate_email}: {e}")
@@ -296,35 +337,51 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
     
     # Job description analysis agent to analyze the job description and refer to the questionnaire
     score_calculator_analyst = autogen.AssistantAgent(name="score_calculator_analyst", system_message = f"""
-                                                                Your task is to accurately calculate the final weighted and normalized score from the questionnaire responses.
+Your task is to accurately calculate the final weighted and normalized score from the questionnaire responses.
 
-                                                                1. **Input Validation**:
-                                                                - Ensure that each question has a valid score (between 0 and 5) and a valid weight (non-negative).
-                                                                - If any score or weight is missing or invalid, raise an error and skip to the next valid question.
+1. **Input Validation**:
+- Ensure that each question has a valid score (between 0 and 5) and a valid weight (non-negative).
+- If any score or weight is missing or invalid, raise an error and skip to the next valid question.
 
-                                                                2. **Candidate Score Calculation**:
-                                                                - For each valid question:
-                                                                    - Multiply the response score by the corresponding question weight to calculate the weighted score.
-                                                                    - **Validation**: Ensure that the weighted score for each question does not exceed the maximum possible weighted score for that question (i.e., 5 multiplied by the question's weight).
-                                                                - Sum all validated weighted scores across all sections to obtain the **Candidate's Total Score**.
+2. **Candidate Score Calculation**:
+- For each valid question:
+    - Multiply the response score by the corresponding question weight to calculate the weighted score.
+    - **Validation**: Ensure that the weighted score for each question does not exceed the maximum possible weighted score for that question (i.e., 5 multiplied by the question's weight).
+- Sum all validated weighted scores across all sections to obtain the **Candidate's Total Score**.
 
-                                                                3. **Total Possible Score Calculation**:
-                                                                - For each question, calculate the maximum possible score by multiplying the highest possible score (e.g., 5) by the weight of that question.
-                                                                - Sum all maximum possible scores across all sections to obtain the **Total Possible Score**.
-                                                                - **Validation**: Ensure the Total Possible Score is non-zero and valid. If it's zero or invalid, return an error.
+3. **Total Possible Score Calculation**:
+- For each question, calculate the maximum possible score by multiplying the highest possible score (e.g., 5) by the weight of that question.
+- Sum all maximum possible scores across all sections to obtain the **Total Possible Score**.
+- **Validation**: Ensure the Total Possible Score is non-zero and valid. If it's zero or invalid, return an error.
 
-                                                                4. **Final Score Calculation**:
-                                                                - Normalize the candidate’s total score by dividing the **Candidate's Total Score** by the **Total Possible Score**.
-                                                                - **Validation**: Ensure the normalized score is within the valid range (0% to 100%).
-                                                                    - If the normalized score exceeds 100%, recalculate the score and correct it based on the validated weights and scores.
-                                                                    - **Validation**: Ensure that no rounding or precision errors lead to a score greater than 100%.
+4. **Final Score Calculation**:
+- Normalize the candidate’s total score by dividing the **Candidate's Total Score** by the **Total Possible Score**.
+- **Validation**: Ensure the normalized score is within the valid range (0% to 100%).
+    - If the normalized score exceeds 100%, recalculate the score and correct it based on the validated weights and scores.
+    - **Validation**: Ensure that no rounding or precision errors lead to a score greater than 100%.
 
-                                                                5. **Output**:
-                                                                - Return the candidate’s validated and corrected final weighted normalized score as a percentage (between 0% and 100%).
-                                                                - If any errors or inconsistencies occur, clearly state them and indicate which steps failed.
+5. **Output**:
+- Return the candidate’s validated and corrected final weighted normalized score as a percentage (between 0% and 100%).
+- If any errors or inconsistencies occur, clearly state them and indicate which steps failed.
 
-                                                                Make sure every calculation and validation is done carefully to avoid any incorrect results.
-                                                                """,
+**IMPORTANT:**
+- Never use 0.85 or 85% as a default score. Always compute the score strictly based on the input values for each candidate.
+- If the input data is missing or incomplete, state this clearly and do not return a default score.
+
+**Example Calculation:**
+Suppose you receive the following questionnaire output:
+[
+    {"question": "Python experience?", "weight": 2, "scoring": 5},
+    {"question": "Team leadership?", "weight": 1, "scoring": 3}
+]
+Calculation steps:
+- Weighted sum = (5*2) + (3*1) = 10 + 3 = 13
+- Max possible = (5*2) + (5*1) = 10 + 5 = 15
+- Normalized score = 13 / 15 = 0.8667
+- Output: 0.87 (rounded to two decimal places)
+
+Make sure every calculation and validation is done carefully to avoid any incorrect results.
+""",
                                                     llm_config={"config_list": config_list, 
                                                                 "max_tokens": 2000})
     
