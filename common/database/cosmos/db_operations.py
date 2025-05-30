@@ -106,6 +106,57 @@ def upsert_jobDetails(jobData):
         fetch_resume_with_email_and_job(job_id, email)
         upsert_candidate(application_data)
 
+def delete_job(job_id):
+    """
+    Delete a job from the job description container by job_id.
+    """
+    try:
+        container = containers[config['database']['job_description_container_name']]
+        container.delete_item(item=job_id, partition_key=job_id)
+        print(f"Job {job_id} deleted successfully.")
+        return True
+    except Exception as e:
+        print(f"Failed to delete job {job_id}: {e}")
+        return False
+
+def delete_applications_by_job_id(job_id):
+    """
+    Delete all candidate application records for a given job_id from the application container.
+    """
+    try:
+        container = containers[config['database']['application_container_name']]
+        query = f"SELECT c.id FROM c WHERE c.job_id = '{job_id}'"
+        items = list(container.query_items(query=query, enable_cross_partition_query=True))
+        for item in items:
+            container.delete_item(item=item['id'], partition_key=job_id)
+            print(f"Deleted application {item['id']} for job {job_id}")
+        print(f"All applications for job {job_id} deleted.")
+        return True
+    except Exception as e:
+        print(f"Failed to delete applications for job {job_id}: {e}")
+        return False
+
+        print("Upserting job data:", jobData)
+        # Ensure both id and job_id are present
+        if "id" not in jobData and "job_id" in jobData:
+            jobData["id"] = jobData["job_id"]
+        elif "job_id" not in jobData and "id" in jobData:
+            jobData["job_id"] = jobData["id"]
+            
+        print("Final job data to upsert:", jobData)
+        containers[config['database']['job_description_container_name']].upsert_item(jobData)
+        print(f"Job data upserted successfully!")
+        
+        # Verify the job was saved
+        saved_job = fetch_job_description(jobData["job_id"])
+        print("Verified saved job:", saved_job)
+        
+    except Exception as e:
+        print(f"An error occurred while upserting job: {e}")
+        print("Saving candidate data:", application_data)
+        fetch_resume_with_email_and_job(job_id, email)
+        upsert_candidate(application_data)
+
 def upsert_candidate(candidate_data):
     """
     Upsert a candidate application into the database.

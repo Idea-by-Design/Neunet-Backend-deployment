@@ -217,7 +217,8 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
         if not candidates:
             return []
         # Fetch all rankings for this job in one go
-        rankings_map = db_operations.fetch_candidate_rankings(job_id)
+        rankings_map = { (k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
+        print(f"[DEBUG] rankings_map for job {job_id}: {rankings_map}")
         patched_candidates = []
         for cand in candidates:
             resume = None
@@ -227,12 +228,18 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
                 resume = cand['resume']
             cand = dict(cand)
             cand['resume'] = resume
-            # Set ranking from ranking container if available
-            email = cand.get('email')
+            # Normalize email for lookup
+            email = (cand.get('email') or '').strip().lower()
+            print(f"[DEBUG] Checking candidate email: {email}")
             if email and email in rankings_map:
-                cand['ranking'] = rankings_map[email]['ranking']
+                raw_ranking = rankings_map[email]['ranking']
+                # Normalize: if 0 < ranking <= 1, treat as normalized float, else use as-is
+                if isinstance(raw_ranking, (float, int)) and 0 < raw_ranking <= 1:
+                    cand['ranking'] = round(raw_ranking * 100)
+                else:
+                    cand['ranking'] = round(raw_ranking)
             else:
-                cand['ranking'] = 0.0
+                cand['ranking'] = 0
             patched_candidates.append(cand)
         return patched_candidates
     except Exception as e:
