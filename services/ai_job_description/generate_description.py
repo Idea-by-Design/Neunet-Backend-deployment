@@ -19,9 +19,6 @@ print("AZURE_OPENAI_ENDPOINT:", os.getenv("AZURE_OPENAI_ENDPOINT"))
 print("api_version:", os.getenv("api_version"))
 print("deployment_name:", os.getenv("deployment_name"))
 
-client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("api_version"))
-
-model= os.getenv("deployment_name")
 
 def generate_description(data):
     # Ensure all required keys for prompt formatting are present
@@ -147,15 +144,21 @@ def fill_missing_fields_with_defaults(data):
     return data
 
 def call_openai_api(prompt):
+    from openai import AzureOpenAI
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_version=os.getenv("api_version")
+    )
+    model = os.getenv("deployment_name")
+    # Use Azure OpenAI to generate text based on the prompt
     response = client.chat.completions.create(
         model=model,
-        messages=[{"role": "system", "content": "You are an AI assistant that helps generate comprehensive and compelling job descriptions based on the provided data.",
-                    "role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+        max_tokens=800,
     )
-    return response.choices[0].message.content
-
-# def get_info_from_chatbot_or_api(job_id, field, question):
-#     # Example: Call an API that interacts with the recruiter to get missing information
+    return response.choices[0].message.content.strip()
 #     # This is a placeholder for your actual implementation
 
 #     api_url = os.getenv('INFO_GATHERING_API_URL')  # Ensure you have this environment variable set

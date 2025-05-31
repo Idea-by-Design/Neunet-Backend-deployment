@@ -18,6 +18,27 @@ import io
 
 app = FastAPI(title="Neunet Recruitment API")
 
+# --- GitHub Analysis Endpoint ---
+from services.github_analysis.analyze_github import analyze_github_profile
+from fastapi import Body
+from pydantic import BaseModel
+
+class GitHubAnalysisRequest(BaseModel):
+    github_identifier: str
+    candidate_email: str
+
+@app.post("/api/github-analysis")
+async def github_analysis(request: GitHubAnalysisRequest = Body(...)):
+    try:
+        result = analyze_github_profile(request.github_identifier, request.candidate_email)
+        return {"success": True, "data": result}
+    except Exception as e:
+        import traceback
+        print("[ERROR] Exception in /api/github-analysis:", e)
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
 # ------------------- Resume Parser Endpoint -------------------
 from fastapi import UploadFile, File
 import shutil
@@ -56,13 +77,7 @@ async def parse_resume(file: UploadFile = File(...)):
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://www.neunet.io",      # Production (www)
-        "https://neunet.io",          # Production (non-www)
-        "http://localhost:5173",      # Local Vite dev server
-        "http://localhost:8000",      # Local FastAPI (if needed)
-    ],  # Allow production and local dev
-
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

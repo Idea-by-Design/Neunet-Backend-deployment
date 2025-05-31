@@ -27,7 +27,30 @@ config_list = [{"model": os.getenv("deployment_name"),
                             "api_type": os.getenv("api_type"),  
                             "api_version": os.getenv("api_version")}]
 
+# --- Helper for async/background usage in FastAPI ---
+def run_ranking_as_background_task(job_id, job_questionnaire_id, resume, job_description, candidate_email, job_questionnaire):
+    """
+    Helper function to run initiate_chat as a background task in FastAPI.
+    Usage: background_tasks.add_task(run_ranking_as_background_task, ...)
+    """
+    try:
+        result = initiate_chat(job_id, job_questionnaire_id, resume, job_description, candidate_email, job_questionnaire)
+        print(f"[BackgroundTask] Ranking completed for {candidate_email} on job {job_id}.")
+        return result
+    except Exception as e:
+        print(f"[BackgroundTask] Error running ranking: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
 def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candidate_email, job_questionnaire):
+    """
+    Main entrypoint for running the multi-agent ranking workflow.
+    If running in a FastAPI endpoint, you should call this inside a BackgroundTasks context for long-running jobs.
+
+    # Example usage in FastAPI handler:
+    # from fastapi import BackgroundTasks
+    # background_tasks.add_task(initiate_chat, job_id, job_questionnaire_id, resume, job_description, candidate_email, job_questionnaire)
+    """
     import logging
     # Debug: Show resume type and preview
     try:
@@ -60,7 +83,15 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                 return None
 
         # Ranking tool function
-        def ranking_tool(candidate_email, ranking, conversation, resume, explanation=None):
+        def ranking_tool(candidate_email, ranking, conversation, resume, explanation):
+    """
+    Store candidate ranking with required explanation. Must be called with all arguments as keyword arguments for compatibility with agent calls.
+    :param candidate_email: Candidate's email
+    :param ranking: Ranking score
+    :param conversation: Conversation log or summary
+    :param resume: Resume data
+    :param explanation: Explanation string for the ranking (REQUIRED, must not be empty)
+    """
             print(f"[DEBUG] Entered ranking_tool for candidate_email={candidate_email}, ranking={ranking}")
             try:
                 # Sanitize all inputs to avoid JSON errors
@@ -73,14 +104,14 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                     print("[DEBUG] Returning early from ranking_tool due to payload error.")
                     return "Payload creation failed due to special characters."
 
+                if not explanation or not isinstance(explanation, str) or not explanation.strip():
+                    raise ValueError("Explanation for ranking must not be empty.")
+
                 # Store the ranking record with explanation using the correct function
                 try:
                     print(f"[DEBUG] About to call store_candidate_ranking for job_id={job_id}, candidate_email={candidate_email}")
                     print(f"[DEBUG] ranking: {ranking}")
                     print(f"[DEBUG] explanation: {explanation}")
-                    if not explanation or not isinstance(explanation, str) or not explanation.strip():
-                        print(f"[ERROR] Missing or empty explanation for candidate_email={candidate_email}, ranking={ranking}")
-                        raise ValueError("Explanation for ranking must not be empty.")
                     store_candidate_ranking(job_id, candidate_email, ranking, explanation)
                     print("[DEBUG] Ranking stored successfully with explanation.")
                 except Exception as e:

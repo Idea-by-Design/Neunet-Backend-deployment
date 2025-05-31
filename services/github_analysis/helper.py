@@ -12,9 +12,6 @@ from pathlib import Path
 backend_root = Path(__file__).resolve().parent.parent.parent.parent
 load_dotenv(backend_root / ".env")
 
-client = AzureOpenAI(api_key=os.getenv("AZURE_OPENAI_API_KEY"), azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), api_version=os.getenv("api_version"))
-
-model= os.getenv("deployment_name")
 
 def extract_github_username(github_identifier):
     """ Extracts the GitHub username from a URL or returns the identifier if it's already a username. """
@@ -31,6 +28,14 @@ def fetch_candidate_commits(repo, username):
 
 def analyze_contributions_with_llm(repo, candidate_email, candidate_commits):
     """ Uses an LLM to analyze the candidate's contributions. """
+    from openai import AzureOpenAI
+    # Initialize the client only when needed
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_version=os.getenv("api_version")
+    )
+    model = os.getenv("deployment_name")
     # Prepare data for LLM
     context = f"""
     Repository Name: {repo.name}

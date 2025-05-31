@@ -1,7 +1,7 @@
 import github
 from github import Github
 import os
-from services.common.utils.config_utils import load_config
+from common.utils.config_utils import load_config
 from services.github_analysis.helper import extract_github_username, fetch_candidate_commits, analyze_contributions_with_llm
 from dotenv import load_dotenv
 
