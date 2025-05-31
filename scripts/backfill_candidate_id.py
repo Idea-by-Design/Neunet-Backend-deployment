@@ -3,7 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from azure.cosmos import CosmosClient
-from neunet_ai_services.common.utils.config_utils import load_config
+from common.utils.config_utils import load_config
 
 # Load config
 config = load_config()

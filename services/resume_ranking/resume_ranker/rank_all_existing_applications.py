@@ -1,7 +1,7 @@
 import sys
 import os
 import json
-# Ensure neunet_ai_services is in sys.path for absolute imports
+# Ensure project root is in sys.path for absolute imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../')))
 from services.resume_ranking.resume_ranker.rank_on_application import rank_candidate_on_application
 from common.database.cosmos.db_operations import fetch_all_jobs, fetch_top_k_candidates_by_count

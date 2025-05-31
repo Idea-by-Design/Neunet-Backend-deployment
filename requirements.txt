@@ -19,3 +19,4 @@ reportlab
 PyGithub
 autogen
 sqlalchemy
+flaml[automl]

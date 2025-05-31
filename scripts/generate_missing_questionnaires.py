@@ -8,11 +8,11 @@ from dotenv import load_dotenv
 
 # Add project root and correct service directory to sys.path for absolute imports to work
 project_root = os.path.dirname(os.path.abspath(__file__))
-# Add the parent directory of neunet_ai_services to sys.path
+# sys.path modification not needed if running from root; ensure imports are relative to root.
 sys.path.append(project_root)
 
 # Load .env from the correct directory (underscore, not hyphen!)
-load_dotenv(dotenv_path=os.path.join(project_root, 'neunet_ai_services', '.env'))
+load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
 from common.database.cosmos import db_operations
 from services.resume_ranking.job_description_questionnaire.jd_questionnaire_generator import generate_questionnaire

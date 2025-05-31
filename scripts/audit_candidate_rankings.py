@@ -2,7 +2,7 @@
 Script to audit all candidate records in the applications container and report the distribution of 'ranking' values.
 Usage:
     python audit_candidate_rankings.py
-Run from the neunet_ai_services root directory.
+Run from the project root directory.
 """
 import sys
 import os

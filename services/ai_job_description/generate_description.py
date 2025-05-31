@@ -6,8 +6,8 @@ import requests
 from dotenv import load_dotenv
 from pathlib import Path
 
-# Always load the .env from the neunet_ai_services project root, regardless of where the server is started
-backend_root = Path(__file__).resolve().parent.parent.parent  # neunet_ai_services directory
+# Always load the .env from the project root, regardless of where the server is started
+backend_root = Path(__file__).resolve().parent.parent.parent  # project root directory
 env_path = backend_root / ".env"
 print("[DEBUG] .env path:", env_path)
 print("[DEBUG] .env exists:", env_path.exists())

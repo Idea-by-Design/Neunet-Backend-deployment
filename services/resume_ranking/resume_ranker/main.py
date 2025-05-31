@@ -2,7 +2,7 @@ import os
 import sys
 from pathlib import Path
 
-# Ensure 'services' is a top-level package when running from neunet_ai_services
+# Ensure 'services' is a top-level package when running from the project root
 import sys, os
 sys.path.insert(0, os.path.abspath("."))
 

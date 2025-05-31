@@ -30,7 +30,7 @@ if dotenv_path:
 print("DOTENV PATH:", dotenv_path)
 print("ENV EXISTS:", os.path.exists(str(dotenv_path)))
 from dotenv import load_dotenv
-# Always load the .env from the neunet_ai_services directory, regardless of where server is started
+# Always load the .env from the project root, regardless of where server is started
 load_dotenv(dotenv_path=dotenv_path)
 
 # DEBUG: Print out loaded Azure OpenAI env vars (mask API key for safety)

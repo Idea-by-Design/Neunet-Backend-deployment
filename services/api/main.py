@@ -8,6 +8,7 @@ from datetime import datetime
 import random
 import os
 import sys
+import tempfile
 
 # Add the project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -251,17 +252,47 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
             cand = dict(cand)
             cand['resume'] = resume
             email = (cand.get('email') or '').strip().lower()
+            from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+            import re
+            # If ranking is missing or zero, re-run ranking synchronously
+            ranking_val = 0
+            explanation = None
             if email and (job_id, email) in rankings_map:
                 raw_ranking = rankings_map[(job_id, email)].get('ranking', 0)
                 explanation = rankings_map[(job_id, email)].get('explanation', None)
                 if isinstance(raw_ranking, (float, int)) and 0 < raw_ranking <= 1:
-                    cand['ranking'] = round(raw_ranking * 100)
+                    ranking_val = round(raw_ranking * 100)
                 else:
-                    cand['ranking'] = round(raw_ranking)
-                cand['explanation'] = explanation
+                    ranking_val = round(raw_ranking)
+            if ranking_val == 0:
+                # Try to re-rank synchronously
+                job_description = db_operations.fetch_job_description(job_id)
+                job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+                job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
+                questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
+                job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
+                resume_text = ''
+                parsed_resume = cand.get('parsed_resume')
+                if parsed_resume and isinstance(parsed_resume, dict) and 'raw_text' in parsed_resume:
+                    resume_text = parsed_resume['raw_text']
+                if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
+                    try:
+                        ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
+                        if isinstance(ranking_result, dict) and 'score' in ranking_result:
+                            ranking_val = ranking_result['score']
+                        elif isinstance(ranking_result, (int, float)):
+                            ranking_val = ranking_result
+                        elif isinstance(ranking_result, str):
+                            match = re.search(r"([0-9]+\.?[0-9]*)", ranking_result)
+                            if match:
+                                ranking_val = float(match.group(1))
+                        cand['ranking'] = ranking_val
+                        db_operations.upsert_candidate(cand)
+                    except Exception as e:
+                        print(f"[ERROR] Failed to rerank candidate {email}: {e}")
             else:
-                cand['ranking'] = 0
-                cand['explanation'] = None
+                cand['ranking'] = ranking_val
+            cand['explanation'] = explanation
             patched_candidates.append(cand)
         return patched_candidates
     except Exception as e:
@@ -322,6 +353,26 @@ async def get_candidate_by_id(candidate_id: str):
         if parsed_resume and parsed_resume.get('skills'):
             candidate_profile['skills'] = parsed_resume['skills']
         candidate_profile['candidate_id'] = all_applications[0].get('candidate_id') or all_applications[0].get('email')
+
+        # --- GitHub Analysis Section ---
+        github_username = None
+        # Try to get from explicit field, then from resume links, then from jobsApplied
+        if 'github' in candidate_profile and candidate_profile['github']:
+            github_username = candidate_profile['github']
+        elif parsed_resume and parsed_resume.get('links', {}).get('gitHub'):
+            github_username = parsed_resume['links']['gitHub']
+        elif parsed_resume and parsed_resume.get('links', {}).get('github'):
+            github_username = parsed_resume['links']['github']
+        # Fallback: check jobsApplied
+        if not github_username and candidate_profile.get('jobsApplied'):
+            for job in candidate_profile['jobsApplied']:
+                if job.get('github'):
+                    github_username = job['github']
+                    break
+        github_analysis = None
+        if github_username:
+            github_analysis = db_operations.fetch_github_analysis_by_candidate(candidate_profile.get('email'), github_username)
+        candidate_profile['github_analysis'] = github_analysis
         return candidate_profile
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -413,9 +464,16 @@ async def apply_for_job(
                 text, hyperlinks = parse_doc(temp_path)
             else:
                 text, hyperlinks = '', []
-            parsed_resume = parse_resume_json(text, hyperlinks)
-        except Exception as e:
-            parsed_resume = None
+            print(f"[DEBUG] Uploaded file: {resume.filename}, suffix: {suffix}")
+            print(f"[DEBUG] Parsed resume_text length: {len(text) if text else 0}")
+            if not text or not str(text).strip():
+                print(f"[ERROR] Resume parsing failed or resume is empty for file: {resume.filename}")
+                raise HTTPException(status_code=400, detail="Resume could not be parsed. Please upload a valid PDF or DOCX file with readable text.")
+            try:
+                parsed_resume = parse_resume_json(text, hyperlinks)
+            except Exception as e:
+                print(f"[ERROR] Failed to parse resume JSON: {e}")
+                parsed_resume = None
         finally:
             try:
                 if 'temp_path' in locals() and os.path.exists(temp_path):
@@ -430,20 +488,37 @@ async def apply_for_job(
         resume_text = text if 'text' in locals() else ''
         job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
         ranking_score = ranking
+        explanation = None
+        print("[DEBUG] Ranking eligibility check:")
+        print(f"  job_id: {job_id} (type: {type(job_id)})")
+        print(f"  job_questionnaire_id: {job_questionnaire_id} (type: {type(job_questionnaire_id)})")
+        print(f"  resume_text: {repr(resume_text)[:100]} (type: {type(resume_text)})")
+        print(f"  job_description_text: {repr(job_description_text)[:100]} (type: {type(job_description_text)})")
+        print(f"  email: {email} (type: {type(email)})")
+        print(f"  questionnaire: {repr(questionnaire)[:100]} (type: {type(questionnaire)})")
         if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
             try:
                 ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
-                if isinstance(ranking_result, dict) and 'score' in ranking_result:
-                    ranking_score = ranking_result['score']
+                print(f"[DEBUG] Full ranking_result: {repr(ranking_result)}")
+                if isinstance(ranking_result, dict):
+                    ranking_score = ranking_result.get('score')
+                    explanation = ranking_result.get('explanation')
                 elif isinstance(ranking_result, (int, float)):
                     ranking_score = ranking_result
+                    explanation = None
                 elif isinstance(ranking_result, str):
                     import re
                     match = re.search(r"([0-9]+\.?[0-9]*)", ranking_result)
                     if match:
                         ranking_score = float(match.group(1))
+                    explanation = None
+                if ranking_score is None or explanation is None or not str(explanation).strip():
+                    print(f"[ERROR] Ranking or explanation missing. ranking_score: {ranking_score}, explanation: {explanation}, ranking_result: {repr(ranking_result)}")
+                    raise HTTPException(status_code=500, detail=f"Ranking or explanation missing from ranking engine. Both are required. Debug: ranking_result={repr(ranking_result)}")
             except Exception as e:
-                ranking_score = ranking
+                raise HTTPException(status_code=500, detail=f"Ranking failed: {e}")
+        else:
+            raise HTTPException(status_code=500, detail="Insufficient data to perform ranking.")
         application_data = {
             "id": f"{job_id}_{email}",
             "job_id": job_id,
@@ -451,6 +526,7 @@ async def apply_for_job(
             "email": email,
             "cover_letter": cover_letter,
             "ranking": ranking_score,
+            "explanation": explanation,
             "status": "applied",
             "applied_at": datetime.utcnow().isoformat(),
             "resume_blob_name": resume_blob_name,
@@ -459,9 +535,9 @@ async def apply_for_job(
         }
         from common.database.cosmos.db_operations import upsert_candidate
         upsert_candidate(application_data)
-        if background_tasks is not None:
-            background_tasks.add_task(rank_candidate_resume_task, job_id, email, resume_blob_name, parsed_resume)
-        return {"message": "Application submitted successfully. Ranking will be available soon."}
+        # Synchronous ranking: do not use background task
+        # rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume)  # No longer needed; ranking is immediate
+        return {"message": "Application submitted successfully. Ranking is available immediately.", "ranking": ranking_score}
     except Exception as e:
         import traceback
         print(f"[ERROR] Exception in apply_for_job: {e}\n{traceback.format_exc()}")

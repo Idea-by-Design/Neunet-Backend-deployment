@@ -52,8 +52,10 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
     # background_tasks.add_task(initiate_chat, job_id, job_questionnaire_id, resume, job_description, candidate_email, job_questionnaire)
     """
     import logging
+    ranking_result_holder = {}
     # Debug: Show resume type and preview
     try:
+        questionnaire = job_questionnaire  # Always assign at the top
         print(f"[DEBUG] [initiate_chat] Type of resume for candidate_email {candidate_email}: {type(resume)}")
         if isinstance(resume, str):
             print(f"[DEBUG] [initiate_chat] Preview of resume: {resume[:200]}...")
@@ -62,8 +64,10 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
         # Validate resume
         if not resume or (isinstance(resume, str) and resume.strip() == ""):
             logging.warning(f"[RANKING] Skipping ranking for {candidate_email}: Resume is missing or invalid.")
-            print(f"[DEBUG] [initiate_chat] Skipping ranking for {candidate_email}: Resume is missing or invalid.")
+            print(f"[DEBUG] [initiate_chat] Skipping ranking for {candidate_email}: Resume is missing or invalid. Returning None early.")
             return None
+        print(f"[DEBUG] [initiate_chat] Starting ranking for job_id={job_id}, candidate_email={candidate_email}")
+        print(f"[DEBUG] [initiate_chat] Questionnaire: {questionnaire}")
         print(f"[DEBUG] [initiate_chat] Starting ranking for job_id={job_id}, candidate_email={candidate_email}")
 
         # Use the job_questionnaire that is passed as an argument
@@ -72,7 +76,11 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
         # Terminates the conversation if the message is "TERMINATE"
         def is_termination_msg(message):
             has_content = "content" in message and message["content"] is not None
-            return has_content and "TERMINATE" in message["content"]
+            return has_content and (
+                "TERMINATE" in message["content"] or
+                "Ranking entry saved" in message["content"] or
+                "Ranking complete" in message["content"]
+            )
 
         def create_json_safe_payload(data):
             try:
@@ -83,16 +91,7 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                 return None
 
         # Ranking tool function
-        def ranking_tool(candidate_email, ranking, conversation, resume, explanation):
-            """
-            Store candidate ranking with required explanation. Must be called with all arguments as keyword arguments for compatibility with agent calls.
-            :param candidate_email: Candidate's email
-            :param ranking: Ranking score
-            :param conversation: Conversation log or summary
-            :param resume: Resume data
-            :param explanation: Explanation string for the ranking (REQUIRED, must not be empty)
-            """
-            print(f"[DEBUG] Entered ranking_tool for candidate_email={candidate_email}, ranking={ranking}")
+        def ranking_tool(candidate_email, ranking, conversation, resume, explanation=None):
             try:
                 # Sanitize all inputs to avoid JSON errors
                 candidate_email_safe = create_json_safe_payload(candidate_email)
@@ -100,33 +99,46 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
                 conversation_safe = create_json_safe_payload(conversation)
 
                 if not all([candidate_email_safe, resume_safe, conversation_safe]):
-                    print("[DEBUG] Error: One or more payload fields could not be converted to JSON-safe format.")
-                    print("[DEBUG] Returning early from ranking_tool due to payload error.")
+                    print("Error: One or more payload fields could not be converted to JSON-safe format.")
                     return "Payload creation failed due to special characters."
 
-                if not explanation or not isinstance(explanation, str) or not explanation.strip():
-                    raise ValueError("Explanation for ranking must not be empty.")
+                if explanation is None or not str(explanation).strip():
+                    print(f"[ERROR] Explanation is missing for candidate {candidate_email}. Explanation is required.")
+                    raise ValueError("Explanation is required for ranking_tool.")
 
-                # Store the ranking record with explanation using the correct function
+                # Fetch the application data from Cosmos DB using job_id
+                ranking_data = fetch_application_by_job_id(job_id)
+
+                # If no ranking data is found, create a new application
+                if not ranking_data:
+                    ranking_data = create_application_for_job_id(job_id, job_questionnaire_id)
+
+                # Generate a unique ID for the ranking entry (using job_id and job_questionnaire_id)
+                unique_id = f"{job_id}_{job_questionnaire_id}_{str(uuid.uuid4())}"
+
                 try:
-                    print(f"[DEBUG] About to call store_candidate_ranking for job_id={job_id}, candidate_email={candidate_email}")
+                    # Debug print before saving
+                    print(f"[DEBUG] About to save ranking for job_id={job_id}, candidate_email={candidate_email}")
+                    print(f"[DEBUG] ranking_data: {json.dumps(ranking_data, indent=2)}")
                     print(f"[DEBUG] ranking: {ranking}")
-                    print(f"[DEBUG] explanation: {explanation}")
                     store_candidate_ranking(job_id, candidate_email, ranking, explanation)
-                    print("[DEBUG] Ranking stored successfully with explanation.")
+                    print(f"[DEBUG] Ranking stored successfully for {candidate_email} with explanation.")
+                    # Store result for return to API
+                    ranking_result_holder['score'] = ranking
+                    ranking_result_holder['explanation'] = explanation
+                    return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
                 except Exception as e:
-                    print(f"[ERROR] Exception in store_candidate_ranking for candidate_email {candidate_email}: {e}")
+                    print(f"[ERROR] Exception in ranking_tool for candidate_email {candidate_email}: {e}")
                     import traceback; traceback.print_exc()
-                    print("[DEBUG] Returning error from ranking_tool due to exception.")
                     return None
 
-                return f"Ranking entry saved for candidate email: {candidate_email_safe} with explanation."
-
             except Exception as e:
-                print(f"[ERROR] An error occurred in the ranking tool: {e}")
+                print(f"An error occurred in the ranking tool: {e}")
                 import traceback; traceback.print_exc()
-                print("[DEBUG] Returning error from ranking_tool due to outer exception.")
                 return None
+
+
+
 
         # User proxy (The user proxy is the main object that you will use to interact with the assistant)
         user_proxy = autogen.UserProxyAgent(name="user_proxy", system_message="You're the hiring manager", 
@@ -212,28 +224,15 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
         import traceback; traceback.print_exc()
         return None
 
-    # Use the job_questionnaire that is passed as an argument
-    questionnaire = job_questionnaire
+    # Return the captured ranking result if available
+    if ranking_result_holder:
+        return ranking_result_holder
+    return None
 
-    # Terminates the conversation if the message is "TERMINATE"
-    def is_termination_msg(message):
-        has_content = "content" in message and message["content"] is not None
-        return has_content and "TERMINATE" in message["content"]
-
-
-
-    def create_json_safe_payload(data):
-        try:
-            # Convert the data to a JSON-compatible string
-            return json.dumps(data, ensure_ascii=False)
-        except (TypeError, ValueError) as e:
-            print(f"Error creating JSON payload: {e}")
-            return None
-    
     
 
     # Ranking tool function
-    def ranking_tool(candidate_email, ranking, conversation, resume):
+    def ranking_tool(candidate_email, ranking, conversation, resume, explanation=None):
         try:
             # Sanitize all inputs to avoid JSON errors
             candidate_email_safe = create_json_safe_payload(candidate_email)
@@ -243,6 +242,10 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
             if not all([candidate_email_safe, resume_safe, conversation_safe]):
                 print("Error: One or more payload fields could not be converted to JSON-safe format.")
                 return "Payload creation failed due to special characters."
+
+            if explanation is None or not str(explanation).strip():
+                print(f"[ERROR] Explanation is missing for candidate {candidate_email}. Explanation is required.")
+                raise ValueError("Explanation is required for ranking_tool.")
 
             # Fetch the application data from Cosmos DB using job_id
             ranking_data = fetch_application_by_job_id(job_id)
@@ -254,21 +257,16 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
             # Generate a unique ID for the ranking entry (using job_id and job_questionnaire_id)
             unique_id = f"{job_id}_{job_questionnaire_id}_{str(uuid.uuid4())}"
 
-            # # Update the ranking data with the new entry
-            # ranking_data[candidate_email_safe] = {
-            #     "Unique_id": unique_id,
-            #     "ranking": ranking,
-            #     "conversation": conversation_safe,
-            #     "resume": resume_safe,
-            # }
-
             try:
                 # Debug print before saving
                 print(f"[DEBUG] About to save ranking for job_id={job_id}, candidate_email={candidate_email}")
                 print(f"[DEBUG] ranking_data: {json.dumps(ranking_data, indent=2)}")
                 print(f"[DEBUG] ranking: {ranking}")
                 store_candidate_ranking(job_id, candidate_email, ranking, explanation)
-                print(f"[DEBUG] Result from save_ranking_data_to_cosmos_db: {result}")
+                print(f"[DEBUG] Ranking stored successfully for {candidate_email} with explanation.")
+                # Store result for return to API
+                ranking_result_holder['score'] = ranking
+                ranking_result_holder['explanation'] = explanation
                 return f"Ranking entry saved with unique ID: {unique_id} for candidate email: {candidate_email_safe}"
             except Exception as e:
                 print(f"[ERROR] Exception in ranking_tool for candidate_email {candidate_email}: {e}")
@@ -277,7 +275,9 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
 
         except Exception as e:
             print(f"An error occurred in the ranking tool: {e}")
+            import traceback; traceback.print_exc()
             return None
+
 
 
 
