@@ -84,14 +84,14 @@ def initiate_chat(job_id, job_questionnaire_id, resume, job_description, candida
 
         # Ranking tool function
         def ranking_tool(candidate_email, ranking, conversation, resume, explanation):
-    """
-    Store candidate ranking with required explanation. Must be called with all arguments as keyword arguments for compatibility with agent calls.
-    :param candidate_email: Candidate's email
-    :param ranking: Ranking score
-    :param conversation: Conversation log or summary
-    :param resume: Resume data
-    :param explanation: Explanation string for the ranking (REQUIRED, must not be empty)
-    """
+            """
+            Store candidate ranking with required explanation. Must be called with all arguments as keyword arguments for compatibility with agent calls.
+            :param candidate_email: Candidate's email
+            :param ranking: Ranking score
+            :param conversation: Conversation log or summary
+            :param resume: Resume data
+            :param explanation: Explanation string for the ranking (REQUIRED, must not be empty)
+            """
             print(f"[DEBUG] Entered ranking_tool for candidate_email={candidate_email}, ranking={ranking}")
             try:
                 # Sanitize all inputs to avoid JSON errors

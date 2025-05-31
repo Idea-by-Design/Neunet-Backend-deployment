@@ -255,14 +255,78 @@ def fetch_candidates_with_github_links():
         print(f"An error occurred while fetching candidates: {e}")
         return []
 
-def store_github_analysis(analysis_data):
-    try:
-        analysis_data["type"] = "github_analysis"
-        print(f"Storing analysis data for {analysis_data['email']}")
-        containers[config['database']['github_container_name']].upsert_item(body=analysis_data)
-        print(f"GitHub analysis data stored successfully for {analysis_data['email']}")
-    except exceptions.CosmosHttpResponseError as e:
-        print(f"Failed to store GitHub analysis data: {e}")
+# --- Candidate-based GitHub Analysis Storage ---
+def upsert_github_analysis(candidate_email, github_identifier, analysis_result):
+    """Upsert GitHub analysis for a candidate (by email + github_identifier)"""
+    item = {
+        "id": f"github_analysis_{candidate_email}_{github_identifier}",
+        "candidate_email": candidate_email,
+        "github_identifier": github_identifier,
+        "type": "github_analysis",
+        "result": analysis_result,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    containers[config['database']['github_container_name']].upsert_item(item)
+    print(f"[INFO] GitHub analysis upserted for candidate_email={candidate_email}, github_identifier={github_identifier}")
+
+def fetch_github_analysis_by_candidate(candidate_email, github_identifier, return_full_item=False):
+    """
+    Fetch GitHub analysis for a candidate (by email + github_identifier).
+    If return_full_item is True, return the full record (including created_at), else just the result.
+    """
+    query = (
+        f"SELECT * FROM c WHERE c.type = 'github_analysis' "
+        f"AND c.candidate_email = '{candidate_email}' "
+        f"AND c.github_identifier = '{github_identifier}'"
+    )
+    results = list(containers[config['database']['github_container_name']].query_items(query=query, enable_cross_partition_query=True))
+    if results:
+        return results[0] if return_full_item else results[0]["result"]
+    return None
+
+# --- Async GitHub Analysis Result Storage (for polling) ---
+def store_github_analysis_result(job_id, result):
+    """Store async GitHub analysis result by job_id (for background task retrieval/polling)"""
+    item = {
+        "id": job_id,
+        "job_id": job_id,
+        "type": "github_analysis_result",
+        "result": result,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    containers[config['database']['github_container_name']].upsert_item(item)
+    print(f"[INFO] GitHub analysis result stored for job_id={job_id}")
+
+def get_github_analysis_result(job_id):
+    """Fetch async GitHub analysis result by job_id (for polling)"""
+    query = f"SELECT * FROM c WHERE c.type = 'github_analysis_result' AND c.job_id = '{job_id}'"
+    results = list(containers[config['database']['github_container_name']].query_items(query=query, enable_cross_partition_query=True))
+    if results:
+        return results[0]["result"]
+    return None
+
+# --- Async Evaluation Score Result Storage ---
+def store_evaluation_score_result(job_id, candidate_email, result):
+    """Store async evaluation score result for a candidate/job pair"""
+    item = {
+        "id": f"{job_id}_{candidate_email}_evaluation_score_result",
+        "job_id": job_id,
+        "candidate_email": candidate_email,
+        "type": "evaluation_score_result",
+        "result": result,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    containers[config['database']['github_container_name']].upsert_item(item)
+    print(f"[INFO] Evaluation score result stored for job_id={job_id}, candidate_email={candidate_email}")
+
+def get_evaluation_score_result(job_id, candidate_email):
+    """Fetch async evaluation score result for a candidate/job pair"""
+    query = f"SELECT * FROM c WHERE c.type = 'evaluation_score_result' AND c.job_id = '{job_id}' AND c.candidate_email = '{candidate_email}'"
+    results = list(containers[config['database']['github_container_name']].query_items(query=query, enable_cross_partition_query=True))
+    if results:
+        return results[0]["result"]
+    return None
+
 
 def fetch_github_analysis(email):
     try:

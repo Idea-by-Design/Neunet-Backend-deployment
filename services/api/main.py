@@ -18,6 +18,15 @@ import io
 
 app = FastAPI(title="Neunet Recruitment API")
 
+# --- CORS Middleware (must be before endpoints) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- GitHub Analysis Endpoint ---
 from services.github_analysis.analyze_github import analyze_github_profile
 from fastapi import Body
@@ -27,22 +36,56 @@ class GitHubAnalysisRequest(BaseModel):
     github_identifier: str
     candidate_email: str
 
-@app.post("/api/github-analysis")
-async def github_analysis(request: GitHubAnalysisRequest = Body(...)):
-    try:
-        result = analyze_github_profile(request.github_identifier, request.candidate_email)
-        return {"success": True, "data": result}
-    except Exception as e:
-        import traceback
-        print("[ERROR] Exception in /api/github-analysis:", e)
-        traceback.print_exc()
-        return {"success": False, "error": str(e)}
+import uuid
 
+# --- Helper functions for async GitHub analysis ---
+def save_github_analysis_result(job_id, result):
+    # Save the result with job_id as key (can use Cosmos DB or in-memory for demo)
+    db_operations.store_github_analysis_result(job_id, result)
+
+def fetch_github_analysis_result(job_id):
+    return db_operations.get_github_analysis_result(job_id)
+
+@app.post("/api/github-analysis")
+async def github_analysis(request: GitHubAnalysisRequest = Body(...), background_tasks: BackgroundTasks = None):
+    import dateutil.parser
+    from datetime import datetime, timedelta
+    job_id = str(uuid.uuid4())
+    existing_full = db_operations.fetch_github_analysis_by_candidate(request.candidate_email, request.github_identifier, return_full_item=True)
+    if existing_full is not None:
+        created_at = existing_full.get("created_at")
+        is_fresh = False
+        if created_at:
+            try:
+                created_dt = dateutil.parser.isoparse(created_at)
+                now = datetime.now(created_dt.tzinfo) if created_dt.tzinfo else datetime.utcnow()
+                is_fresh = (now - created_dt) < timedelta(days=183)
+            except Exception as e:
+                print(f"[WARN] Could not parse created_at for github analysis: {e}")
+        if is_fresh:
+            db_operations.store_github_analysis_result(job_id, {"success": True, "data": existing_full["result"], "cached": True, "age_days": (now - created_dt).days})
+            return {"job_id": job_id, "status": "completed (cached)"}
+    def run_analysis_and_save():
+        try:
+            result = analyze_github_profile(request.github_identifier, request.candidate_email)
+            db_operations.upsert_github_analysis(request.candidate_email, request.github_identifier, result)
+            db_operations.store_github_analysis_result(job_id, {"success": True, "data": result, "cached": False})
+        except Exception as e:
+            db_operations.store_github_analysis_result(job_id, {"success": False, "error": str(e)})
+    if background_tasks is not None:
+        background_tasks.add_task(run_analysis_and_save)
+    else:
+        run_analysis_and_save()
+    return {"job_id": job_id, "status": "processing"}
+
+@app.get("/api/github-analysis/result/{job_id}")
+async def github_analysis_result(job_id: str):
+    result = db_operations.get_github_analysis_result(job_id)
+    if result is None:
+        return {"status": "processing"}
+    return result
 
 # ------------------- Resume Parser Endpoint -------------------
-from fastapi import UploadFile, File
-import shutil
-import tempfile
 from services.resume_parser.parser.openai_resume_parser import parse_resume_json
 from services.resume_parser.parser.pdf_parser import parse_pdf
 from services.resume_parser.parser.doc_parser import parse_doc
@@ -74,15 +117,7 @@ async def parse_resume(file: UploadFile = File(...)):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# --- Job Endpoints ---
 class JobQuestionnaire(BaseModel):
     questions: List[str]
 
@@ -109,40 +144,12 @@ class JobDescription(BaseModel):
             raise ValueError('job_id must be a 6-digit number')
         return v
 
-class CandidateRanking(BaseModel):
-    job_id: str
-    candidate_email: str
-    ranking: float
-    conversation: str
-    resume: dict
-
-class CandidateApplication(BaseModel):
-    name: str
-    email: str
-    resume: str
-    cover_letter: Optional[str] = None
-    ranking: float = Field(default=0.0)  # For testing, we'll set a default ranking
-
-class JobDescriptionRequest(BaseModel):
-    title: str = None
-    company_name: str = None
-    location: str = None
-    type: str = None
-    time_commitment: str = None
-    description: str = None
-    requirements: str = None
-    job_id: str = None
-
-# Job Description Endpoints
 @app.get("/jobs/")
 async def list_jobs():
     try:
-        print("Fetching all jobs...")  # Debug log
         jobs = db_operations.fetch_all_jobs()
-        print(f"Fetched jobs: {jobs}")  # Debug log
         return jobs if jobs else []
     except Exception as e:
-        print(f"Error fetching jobs: {e}")  # Debug log
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/")
@@ -230,30 +237,21 @@ async def get_job_questionnaire(job_id: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# Candidate Endpoints
+# --- Candidate Endpoints ---
 @app.get("/jobs/{job_id}/candidates")
 async def get_job_candidates(job_id: str, top_k: int = 10):
     try:
         candidates = db_operations.fetch_top_k_candidates_by_count(job_id, top_k)
         if not candidates:
             return []
-        # Fetch all rankings for this job in one go
         rankings_map = { (job_id, k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
-        print(f"[DEBUG] rankings_map for job {job_id}: {rankings_map}")
         patched_candidates = []
         for cand in candidates:
-            resume = None
-            if 'parsed_resume' in cand and cand['parsed_resume']:
-                resume = cand['parsed_resume']
-            elif 'resume' in cand and cand['resume']:
-                resume = cand['resume']
+            resume = cand.get('parsed_resume') or cand.get('resume')
             cand = dict(cand)
             cand['resume'] = resume
-            # Normalize email for lookup
             email = (cand.get('email') or '').strip().lower()
-            print(f"[DEBUG] Checking candidate email: {email}")
             if email and (job_id, email) in rankings_map:
-                # Always pick ranking and explanation directly from ranking container
                 raw_ranking = rankings_map[(job_id, email)].get('ranking', 0)
                 explanation = rankings_map[(job_id, email)].get('explanation', None)
                 if isinstance(raw_ranking, (float, int)) and 0 < raw_ranking <= 1:
@@ -267,22 +265,13 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
             patched_candidates.append(cand)
         return patched_candidates
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/candidates/{candidate_id}")
 async def get_candidate_by_id(candidate_id: str):
-    """
-    Return candidate profile and all jobs they've applied to.
-    candidate_id can be email or unique candidate id.
-    """
     try:
-        # Fetch all applications for this candidate by candidate_id and by email, merge and deduplicate
         applications_by_id = db_operations.fetch_applications_by_candidate(candidate_id) or []
         applications_by_email = db_operations.fetch_applications_by_candidate_email(candidate_id) or []
-        # Merge and deduplicate by (job_id, email)
         seen = set()
         all_applications = []
         for app in applications_by_id + applications_by_email:
@@ -292,22 +281,18 @@ async def get_candidate_by_id(candidate_id: str):
                 all_applications.append(app)
         if not all_applications:
             raise HTTPException(status_code=404, detail="Candidate not found")
-        # Profile fields from one application (assuming all have same candidate info)
         profile_fields = [
             'name', 'email', 'avatar', 'role', 'evaluation', 'github', 'skills', 'resume', 'resume_blob_name', 'cover_letter', 'ranking'
         ]
         candidate_profile = {k: all_applications[0].get(k) for k in profile_fields if k in all_applications[0]}
-        # List of jobs applied to
         jobs_applied = []
         for app in all_applications:
             job_id = app.get('job_id')
             job_title = app.get('job_title')
             email = app.get('email')
-            # Patch: Always fetch job title if missing
             if not job_title and job_id:
                 job_desc = db_operations.fetch_job_description(job_id)
                 job_title = job_desc['title'] if job_desc and 'title' in job_desc else job_id
-            # Fetch ranking and explanation from ranking container
             ranking = 0.0
             explanation = None
             if job_id and email:
@@ -326,9 +311,7 @@ async def get_candidate_by_id(candidate_id: str):
                 'score': app.get('score') or ranking,
             })
         candidate_profile['jobsApplied'] = jobs_applied
-        # Set profile ranking as highest ranking across jobs (or 0)
         candidate_profile['ranking'] = max([j['ranking'] for j in jobs_applied] or [0.0])
-        # Add parsed_resume details if available (check both possible field names)
         parsed_resume = None
         if 'parsed_resume' in all_applications[0] and isinstance(all_applications[0]['parsed_resume'], dict):
             parsed_resume = all_applications[0]['parsed_resume']
@@ -336,16 +319,11 @@ async def get_candidate_by_id(candidate_id: str):
         elif 'resume' in all_applications[0] and isinstance(all_applications[0]['resume'], dict):
             parsed_resume = all_applications[0]['resume']
             candidate_profile['parsed_resume'] = parsed_resume
-        # Always set 'skills' from parsed_resume if available
         if parsed_resume and parsed_resume.get('skills'):
             candidate_profile['skills'] = parsed_resume['skills']
-        # Add a unique candidate_id (use email for now if no id field)
         candidate_profile['candidate_id'] = all_applications[0].get('candidate_id') or all_applications[0].get('email')
         return candidate_profile
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/{job_id}/candidates/{candidate_email}/status")
@@ -354,9 +332,6 @@ async def update_candidate_status(job_id: str, candidate_email: str, status: str
         db_operations.update_application_status(job_id, candidate_email, status)
         return {"message": "Status updated successfully"}
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/candidates/{job_id}/{email}/resume")
@@ -379,12 +354,9 @@ async def get_candidate_resume(job_id: str, email: str):
             "Content-Disposition": f"attachment; filename={os.path.basename(blob_name)}"
         })
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# Application Endpoints
+# --- Application Endpoints ---
 @app.get("/applications/{job_id}")
 async def get_job_applications(job_id: str):
     try:
@@ -393,9 +365,6 @@ async def get_job_applications(job_id: str):
             return []
         return applications
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/{job_id}/apply")
@@ -404,19 +373,15 @@ async def apply_for_job(
     name: str = Form(...),
     email: str = Form(...),
     cover_letter: str = Form(None),
-    ranking: float = Form(0.0),  # Will be overwritten by actual ranking logic
+    ranking: float = Form(0.0),
     resume: UploadFile = File(...),
     background_tasks: BackgroundTasks = None
 ):
     try:
-        # Defensive logging and checks
         if resume is None:
-            print("[ERROR] No resume file provided.")
             raise HTTPException(status_code=400, detail="No resume file provided.")
         if not hasattr(resume, 'filename') or resume.filename is None:
-            print(f"[ERROR] Resume filename is missing or None. Resume object: {resume}")
             raise HTTPException(status_code=400, detail="Resume filename is missing.")
-        print(f"[DEBUG] Received resume filename: {resume.filename}")
         AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
         CONTAINER_NAME = "resumes"
         blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
@@ -427,22 +392,16 @@ async def apply_for_job(
         blob_client = container_client.get_blob_client(blob_name)
         data = await resume.read()
         if data is None or len(data) == 0:
-            print("[ERROR] Resume file is empty.")
             raise HTTPException(status_code=400, detail="Resume file is empty.")
         try:
             blob_client.upload_blob(data, overwrite=True)
             resume_blob_name = blob_name
         except Exception as upload_exc:
-            print(f"[ERROR] Resume upload to Azure failed: {upload_exc}")
             resume_blob_name = None
-        # Parse the uploaded resume and store extracted info (github/linkedin/etc)
         parsed_resume = None
-        # Only proceed if the upload was successful
         if not resume_blob_name:
             raise HTTPException(status_code=500, detail="Resume upload failed. Please try again.")
         try:
-            # Save file to temp
-            import tempfile
             suffix = os.path.splitext(resume.filename)[-1].lower()
             fd, temp_path = tempfile.mkstemp(suffix=suffix)
             os.close(fd)
@@ -456,7 +415,6 @@ async def apply_for_job(
                 text, hyperlinks = '', []
             parsed_resume = parse_resume_json(text, hyperlinks)
         except Exception as e:
-            print(f"[WARN] Resume parsing failed: {e}")
             parsed_resume = None
         finally:
             try:
@@ -464,23 +422,17 @@ async def apply_for_job(
                     os.remove(temp_path)
             except Exception:
                 pass
-
-        # --- Integrate Resume Ranking Logic ---
-        # Fetch job description and questionnaire
         from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
-        from common.database.cosmos import db_operations
         job_description = db_operations.fetch_job_description(job_id)
         job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
         job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
         questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
         resume_text = text if 'text' in locals() else ''
         job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
-        # Defensive: Only call ranking if all required fields are present
         ranking_score = ranking
         if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
             try:
                 ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
-                # Try to extract a numeric score from the result (if possible)
                 if isinstance(ranking_result, dict) and 'score' in ranking_result:
                     ranking_score = ranking_result['score']
                 elif isinstance(ranking_result, (int, float)):
@@ -491,18 +443,14 @@ async def apply_for_job(
                     if match:
                         ranking_score = float(match.group(1))
             except Exception as e:
-                print(f"[WARN] Resume ranking logic failed: {e}")
                 ranking_score = ranking
-        else:
-            print("[WARN] Skipping ranking logic due to missing data.")
-
         application_data = {
             "id": f"{job_id}_{email}",
             "job_id": job_id,
             "name": name,
             "email": email,
             "cover_letter": cover_letter,
-            "ranking": ranking,  # Initial placeholder, will update after ranking
+            "ranking": ranking_score,
             "status": "applied",
             "applied_at": datetime.utcnow().isoformat(),
             "resume_blob_name": resume_blob_name,
@@ -511,59 +459,46 @@ async def apply_for_job(
         }
         from common.database.cosmos.db_operations import upsert_candidate
         upsert_candidate(application_data)
-
-        # Trigger resume ranking as a background task
         if background_tasks is not None:
             background_tasks.add_task(rank_candidate_resume_task, job_id, email, resume_blob_name, parsed_resume)
-
         return {"message": "Application submitted successfully. Ranking will be available soon."}
     except Exception as e:
         import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
+        print(f"[ERROR] Exception in apply_for_job: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Background Task for Resume Ranking ---
 def rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume):
     try:
         from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
-        from common.database.cosmos import db_operations
         job_description = db_operations.fetch_job_description(job_id)
         job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
         job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
         questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
-        # Download resume text from blob if needed (parsed_resume may be None)
         resume_text = ''
         if parsed_resume and isinstance(parsed_resume, dict) and 'raw_text' in parsed_resume:
             resume_text = parsed_resume['raw_text']
         else:
-            # Try to download and parse again if needed
             try:
                 AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
                 CONTAINER_NAME = "resumes"
-                from azure.storage.blob import BlobServiceClient
                 blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
                 container_client = blob_service_client.get_container_client(CONTAINER_NAME)
                 blob_client = container_client.get_blob_client(resume_blob_name)
                 stream = blob_client.download_blob().readall()
-                import tempfile
                 suffix = os.path.splitext(resume_blob_name)[-1].lower()
                 fd, temp_path = tempfile.mkstemp(suffix=suffix)
                 os.close(fd)
                 with open(temp_path, "wb") as out_file:
                     out_file.write(stream)
                 if suffix == '.pdf':
-                    from services.resume_parser.parser.pdf_parser import parse_pdf
                     text, hyperlinks = parse_pdf(temp_path)
                 elif suffix in ['.doc', '.docx']:
-                    from services.resume_parser.parser.doc_parser import parse_doc
                     text, hyperlinks = parse_doc(temp_path)
                 else:
                     text, hyperlinks = '', []
                 resume_text = text
                 os.remove(temp_path)
             except Exception as e:
-                print(f"[WARN] Could not re-parse resume from blob: {e}")
                 resume_text = ''
         job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
         if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
@@ -580,35 +515,33 @@ def rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume):
                     if match:
                         ranking_score = float(match.group(1))
                 if ranking_score is not None:
-                    # Update candidate record with new ranking
                     candidate = db_operations.fetch_resume_with_email_and_job(job_id, email)
                     if candidate:
                         candidate['ranking'] = ranking_score
                         db_operations.upsert_candidate(candidate)
-                        print(f"[INFO] Ranking updated for {email} in job {job_id}: {ranking_score}")
             except Exception as e:
-                print(f"[WARN] Resume ranking logic failed in background: {e}")
+                pass
         else:
-            print(f"[WARN] Skipping ranking logic due to missing data for {email} in job {job_id}")
+            pass
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
-        print(f"[ERROR] Exception in background ranking task: {e}")
-        db_operations.upsert_candidate(application_data)
-        return {"message": "Application submitted successfully"}
-    except HTTPException as e:
-        # Already a handled error
-        raise e
-    except Exception as e:
-        import traceback
-        print(f"[ERROR] Exception in apply_for_job: {e}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        pass
 
+# --- Debug/Admin Endpoint ---
 @app.get("/debug/candidates/{job_id}")
 async def get_candidates_for_job(job_id: str):
     candidates = db_operations.fetch_top_k_candidates_by_count(job_id)
     return {"count": len(candidates), "candidates": candidates}
+
+# --- AI Job Description Endpoint ---
+class JobDescriptionRequest(BaseModel):
+    title: str = None
+    company_name: str = None
+    location: str = None
+    type: str = None
+    time_commitment: str = None
+    description: str = None
+    requirements: str = None
+    job_id: str = None
 
 @app.post("/api/generate-job-description")
 def generate_job_description(request: JobDescriptionRequest):
@@ -619,18 +552,15 @@ def generate_job_description(request: JobDescriptionRequest):
         data = request.dict()
         generated = generate_description(data)
         cleaned = generated.strip()
-        # Remove markdown/code block wrappers if present
         if cleaned.lower().startswith('json'):
             cleaned = cleaned.split('\n', 1)[-1]
         cleaned = cleaned.strip('`')
-        # Try to parse as JSON directly
         try:
             result = json.loads(cleaned)
             if isinstance(result, dict):
                 return result
         except Exception:
             pass
-        # Try to extract first JSON object from the string using regex
         match = re.search(r'({[\s\S]*})', cleaned)
         if match:
             try:
@@ -639,12 +569,8 @@ def generate_job_description(request: JobDescriptionRequest):
                     return result
             except Exception:
                 pass
-        # If all parsing fails, raise an error
         raise HTTPException(status_code=500, detail="AI did not return valid JSON. Please try again or check the prompt.")
     except Exception as e:
-        import traceback
-        print("=== EXCEPTION OCCURRED ===")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
