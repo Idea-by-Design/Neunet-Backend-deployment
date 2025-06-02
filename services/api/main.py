@@ -251,6 +251,12 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
             resume = cand.get('parsed_resume') or cand.get('resume')
             cand = dict(cand)
             cand['resume'] = resume
+            # Ensure 'status' is always present
+            if 'status' not in cand or not cand['status']:
+                if 'application_status' in cand and cand['application_status']:
+                    cand['status'] = cand['application_status']
+                else:
+                    cand['status'] = 'applied'
             email = (cand.get('email') or '').strip().lower()
             from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
             import re
@@ -377,10 +383,13 @@ async def get_candidate_by_id(candidate_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/jobs/{job_id}/candidates/{candidate_email}/status")
-async def update_candidate_status(job_id: str, candidate_email: str, status: str):
+from fastapi import Body
+
+@app.post("/jobs/{job_id}/candidates/{candidate_id}/status")
+async def update_candidate_status(job_id: str, candidate_id: str, data: dict = Body(...)):
     try:
-        db_operations.update_application_status(job_id, candidate_email, status)
+        status = data.get("status")
+        db_operations.update_candidate_status_by_id(job_id, candidate_id, status)
         return {"message": "Status updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

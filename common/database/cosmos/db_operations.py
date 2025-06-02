@@ -24,6 +24,45 @@ except Exception as e:
     print(f"Error creating/accessing database: {e}")
     raise e
 
+def update_candidate_status_by_id(job_id, candidate_id, status):
+    valid_statuses = [
+        "Applied",
+        "Application Under Review",
+        "Interview Invite Sent",
+        "Interview Scheduled",
+        "Interview Feedback Under Review",
+        "Offer Extended",
+        "Rejected",
+        "Withdrawn",
+        "Shortlisted"
+    ]
+    try:
+        print(f"[DEBUG] update_candidate_status_by_id called with job_id={job_id}, candidate_id={candidate_id}, status={status}")
+        query = f"SELECT * FROM c WHERE c.candidate_id = '{candidate_id}' AND c.job_id = '{job_id}'"
+        candidates = list(containers[config['database']['application_container_name']].query_items(query=query, enable_cross_partition_query=True))
+        if not candidates:
+            print(f"[DEBUG] No candidate found with candidate_id={candidate_id} and job_id={job_id}")
+            return f"Error: Candidate with candidate_id {candidate_id} not found for job ID {job_id}."
+        candidate = candidates[0]
+        print(f"[DEBUG] Found candidate: {candidate.get('email')} (candidate_id={candidate_id})")
+        # Case-insensitive status validation
+        status_map = {s.lower(): s for s in valid_statuses}
+        normalized_status = status_map.get(status.lower())
+        if normalized_status:
+            candidate["application_status"] = normalized_status
+            candidate["status"] = normalized_status
+            print(f"[DEBUG] Setting status to {normalized_status}")
+        else:
+            candidate["application_status"] = "Unknown"
+            candidate["status"] = "Unknown"
+            print(f"[DEBUG] Invalid status, setting to Unknown")
+        containers[config['database']['application_container_name']].replace_item(item=candidate["id"], body=candidate)
+        print(f"[DEBUG] Status for {candidate_id} updated to '{status}'")
+        return f"Success: Status for {candidate_id} updated to '{status}'."
+    except Exception as e:
+        print(f"[DEBUG] An error occurred: {e}")
+        return f"An error occurred: {e}"
+
 # Fetch applications by candidate_id (for UUID lookup)
 def fetch_applications_by_candidate(candidate_id):
     global containers, config
@@ -379,30 +418,42 @@ def update_recruitment_process(job_id, candidate_email, status, additional_info=
         "Interview Feedback Under Review",
         "Offer Extended",
         "Rejected",
-        "Withdrawn"
+        "Withdrawn",
+        "Shortlisted"
     ]
 
     try:
+        print(f"[DEBUG] update_recruitment_process called with job_id={job_id}, candidate_email={candidate_email}, status={status}")
         job_document = containers[config['database']['job_description_container_name']].read_item(item=str(job_id), partition_key=str(job_id))
-        
+        print(f"[DEBUG] Loaded job_document for job_id={job_id}, candidates={len(job_document.get('candidates', []))}")
+
         if "candidates" not in job_document:
+            print(f"[DEBUG] No candidates found for job_id={job_id}")
             return f"Error: No candidates found for job ID {job_id}."
 
+        updated = False
         for candidate in job_document["candidates"]:
-            if candidate["email"].lower() == candidate_email.lower():  
-                if new_status in valid_statuses:
-                    candidate["application_status"] = new_status
-                    containers[config['database']['job_description_container_name']].replace_item(item=job_document["id"], body=job_document)
-                    return f"Success: Application status for {candidate_email} updated to '{new_status}'."
+            print(f"[DEBUG] Checking candidate: {candidate.get('email')} (target: {candidate_email})")
+            if candidate["email"].lower() == candidate_email.lower():
+                print(f"[DEBUG] Found candidate, setting status to {status}")
+                if status in valid_statuses:
+                    candidate["application_status"] = status
+                    candidate["status"] = status
+                    updated = True
                 else:
                     candidate["application_status"] = "Unknown"
-                    containers[config['database']['job_description_container_name']].replace_item(item=job_document["id"], body=job_document)
-                    return f"Error: Invalid status '{new_status}' provided. Status set to 'Unknown'."
-
-        return f"Error: Candidate with email {candidate_email} not found for job ID {job_id}."
-    
+                    candidate["status"] = "Unknown"
+                    updated = True
+        if updated:
+            print(f"[DEBUG] Saving updated job_document for job_id={job_id}")
+            containers[config['database']['job_description_container_name']].replace_item(item=job_document["id"], body=job_document)
+            print(f"[DEBUG] Status for {candidate_email} updated to '{status}'")
+            return f"Success: Status for {candidate_email} updated to '{status}'."
+        else:
+            print(f"[DEBUG] Candidate with email {candidate_email} not found for job_id={job_id}")
+            return f"Error: Candidate with email {candidate_email} not found for job ID {job_id}."
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"[DEBUG] An error occurred: {e}")
         return f"An error occurred: {e}"
 
 def store_application(application_data):
