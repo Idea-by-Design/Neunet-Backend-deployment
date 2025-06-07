@@ -2,7 +2,7 @@
 
 A powerful backend service that handles job postings, candidate applications, and AI-powered candidate matching for the Neunet platform.
 
-https://neunet-ai-services.onrender.com
+https://neunet-ai-services.onrender.com/docs
 
 ## Tech Stack
 
