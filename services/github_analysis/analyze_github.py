@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file in the project directory
 from pathlib import Path
 # Always load .env from backend root
-backend_root = Path(__file__).resolve().parent.parent.parent.parent
+backend_root = Path(__file__).resolve().parent.parent.parent
 load_dotenv(backend_root / ".env")
 
 # Load configuration
@@ -24,62 +24,62 @@ def analyze_github_profile(github_identifier, candidate_email):
 
     username = extract_github_username(github_identifier)
     user = g.get_user(username)
-    repos = user.get_repos()
+    repos = list(user.get_repos())
 
-    analysis_data = {
-        "github_url": f"https://github.com/{username}",
-        "repositories": []
-    }
+    # Efficient total repo and commit counting
+    total_repos = 0
+    total_commits = 0
+    repo_commit_counts = []
+    repo_data_list = []
 
     for repo in repos:
         if repo.private:
             continue  # Skip private repositories
-
-        print(f"Processing repository: {repo.name}")
-        
         try:
-            # Check if the repository has commits
             commit_count = repo.get_commits().totalCount
-            if commit_count == 0:
-                print(f"Skipping empty repository: {repo.name}")
-                continue
+        except Exception as e:
+            print(f"Error fetching commit count for {repo.name}: {e}")
+            continue
+        if commit_count == 0:
+            continue
+        # Always count towards totals if public and non-empty
+        total_repos += 1
+        total_commits += commit_count
+        if commit_count > 10000:
+            print(f"Large repository {repo.name} (commits: {commit_count}) counted in totals, but excluded from detailed analysis.")
+            continue  # Do not include in detailed/top-5 analysis
+        repo_data = {
+            "name": repo.name,
+            "description": repo.description,
+            "language": repo.language,
+            "topics": repo.get_topics(),
+            "created_at": repo.created_at.isoformat(),
+            "updated_at": repo.updated_at.isoformat(),
+            "pushed_at": repo.pushed_at.isoformat(),
+            "commit_count": commit_count,
+            "stars": repo.stargazers_count,
+            "forks": repo.forks_count,
+            "open_issues": repo.open_issues_count,
+            "watchers": repo.watchers_count
+        }
+        # Fetch commits by the candidate
+        candidate_commits = fetch_candidate_commits(repo, username)
+        # Always include contribution_insights
+        if candidate_commits:
+            contribution_insights = analyze_contributions_with_llm(repo, candidate_email, candidate_commits)
+        else:
+            contribution_insights = None
+        repo_data["contribution_insights"] = contribution_insights
+        repo_data_list.append(repo_data)
 
-            # Collecting basic data
-            repo_data = {
-                "name": repo.name,
-                "description": repo.description,
-                "language": repo.language,
-                "topics": repo.get_topics(),
-                "created_at": repo.created_at.isoformat(),
-                "updated_at": repo.updated_at.isoformat(),
-                "pushed_at": repo.pushed_at.isoformat(),
-                "commit_count": commit_count,
-                "stars": repo.stargazers_count,
-                "forks": repo.forks_count,
-                "open_issues": repo.open_issues_count,
-                "watchers": repo.watchers_count
-            }
+    # Select top 5 repositories by most recent activity (pushed_at)
+    top_repos = sorted(repo_data_list, key=lambda r: r["pushed_at"], reverse=True)[:5]
 
-            # Fetch commits by the candidate
-            candidate_commits = fetch_candidate_commits(repo, username)
-
-            # If the candidate has commits in this repository, analyze them
-            if candidate_commits:
-                # Analyzing contribution with LLM
-                contribution_insights = analyze_contributions_with_llm(repo, candidate_email, candidate_commits)
-                repo_data["contribution_insights"] = contribution_insights
-
-            analysis_data["repositories"].append(repo_data)
-        
-        except github.GithubException as e:
-            # Skip repositories with errors like empty repositories
-            if e.status == 409 and "Git Repository is empty" in e.data['message']:
-                print(f"Skipping repository {repo.name} because it is empty.")
-                continue
-            else:
-                print(f"Error processing repository {repo.name}: {e}")
-                continue  # Skip this repo and proceed with the next one
-
+    analysis_data = {
+        "github_url": f"https://github.com/{username}",
+        "total_repositories": total_repos,
+        "total_commits": total_commits,
+        "repositories": top_repos
+    }
     print(f"Analysis complete for {github_identifier}")
     return analysis_data
-

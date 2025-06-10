@@ -40,18 +40,17 @@ class GitHubAnalysisRequest(BaseModel):
 import uuid
 
 # --- Helper functions for async GitHub analysis ---
-def save_github_analysis_result(job_id, result):
-    # Save the result with job_id as key (can use Cosmos DB or in-memory for demo)
-    db_operations.store_github_analysis_result(job_id, result)
+# Deprecated: No longer used. GitHub analysis is now stored per candidate and GitHub identifier.
+def save_github_analysis_result(*args, **kwargs):
+    pass  # No-op for backward compatibility if called elsewhere.
 
-def fetch_github_analysis_result(job_id):
-    return db_operations.get_github_analysis_result(job_id)
+def fetch_github_analysis_result(candidate_email, github_identifier):
+    return db_operations.fetch_github_analysis_by_candidate(candidate_email, github_identifier)
 
 @app.post("/api/github-analysis")
 async def github_analysis(request: GitHubAnalysisRequest = Body(...), background_tasks: BackgroundTasks = None):
     import dateutil.parser
     from datetime import datetime, timedelta
-    job_id = str(uuid.uuid4())
     existing_full = db_operations.fetch_github_analysis_by_candidate(request.candidate_email, request.github_identifier, return_full_item=True)
     if existing_full is not None:
         created_at = existing_full.get("created_at")
@@ -64,27 +63,31 @@ async def github_analysis(request: GitHubAnalysisRequest = Body(...), background
             except Exception as e:
                 print(f"[WARN] Could not parse created_at for github analysis: {e}")
         if is_fresh:
-            db_operations.store_github_analysis_result(job_id, {"success": True, "data": existing_full["result"], "cached": True, "age_days": (now - created_dt).days})
-            return {"job_id": job_id, "status": "completed (cached)"}
+            return {"success": True, "data": existing_full["result"], "cached": True, "age_days": (now - created_dt).days}
     def run_analysis_and_save():
         try:
             result = analyze_github_profile(request.github_identifier, request.candidate_email)
             db_operations.upsert_github_analysis(request.candidate_email, request.github_identifier, result)
-            db_operations.store_github_analysis_result(job_id, {"success": True, "data": result, "cached": False})
         except Exception as e:
-            db_operations.store_github_analysis_result(job_id, {"success": False, "error": str(e)})
+            return {"success": False, "error": str(e)}
     if background_tasks is not None:
         background_tasks.add_task(run_analysis_and_save)
+        return {"success": False, "status": "processing"}
     else:
         run_analysis_and_save()
-    return {"job_id": job_id, "status": "processing"}
+        # Return latest result after sync
+        latest_full = db_operations.fetch_github_analysis_by_candidate(request.candidate_email, request.github_identifier, return_full_item=True)
+        if latest_full:
+            return {"success": True, "data": latest_full["result"], "cached": False}
+        else:
+            return {"success": False, "error": "Analysis failed or not found."}
 
-@app.get("/api/github-analysis/result/{job_id}")
-async def github_analysis_result(job_id: str):
-    result = db_operations.get_github_analysis_result(job_id)
+@app.get("/api/github-analysis/result/{candidate_email}/{github_identifier}")
+async def github_analysis_result(candidate_email: str, github_identifier: str):
+    result = db_operations.fetch_github_analysis_by_candidate(candidate_email, github_identifier)
     if result is None:
         return {"status": "processing"}
-    return result
+    return {"success": True, "data": result}
 
 # ------------------- Resume Parser Endpoint -------------------
 from services.resume_parser.parser.openai_resume_parser import parse_resume_json
@@ -360,27 +363,53 @@ async def get_candidate_by_id(candidate_id: str):
             candidate_profile['skills'] = parsed_resume['skills']
         candidate_profile['candidate_id'] = all_applications[0].get('candidate_id') or all_applications[0].get('email')
 
+        # --- Use parsed_resume if present, else parse resume JSON ---
+        import json
+        parsed_resume = candidate_profile.get('parsed_resume')
+        if not parsed_resume:
+            resume_str = candidate_profile.get('resume')
+            if resume_str:
+                try:
+                    parsed_resume = json.loads(resume_str)
+                except Exception as e:
+                    print(f"[ERROR] Failed to parse resume JSON for {candidate_profile.get('email')}: {e}")
+
         # --- GitHub Analysis Section ---
+        import re
+        def extract_github_username(github_url_or_username):
+            if not github_url_or_username:
+                return None
+            match = re.search(r"github\.com/([A-Za-z0-9_.-]+)", github_url_or_username)
+            if match:
+                return match.group(1)
+            return github_url_or_username.strip()
+
         github_username = None
-        # Try to get from explicit field, then from resume links, then from jobsApplied
-        if 'github' in candidate_profile and candidate_profile['github']:
-            github_username = candidate_profile['github']
-        elif parsed_resume and parsed_resume.get('links', {}).get('gitHub'):
-            github_username = parsed_resume['links']['gitHub']
-        elif parsed_resume and parsed_resume.get('links', {}).get('github'):
-            github_username = parsed_resume['links']['github']
+        if parsed_resume:
+            links = parsed_resume.get('links', {})
+            github_username = (
+                links.get('gitHub') or links.get('github') or links.get('GitHub') or
+                parsed_resume.get('github') or parsed_resume.get('GitHub')
+            )
         # Fallback: check jobsApplied
         if not github_username and candidate_profile.get('jobsApplied'):
             for job in candidate_profile['jobsApplied']:
                 if job.get('github'):
                     github_username = job['github']
                     break
+
+        # Extra debug logging for diagnosis
+        print(f"[DEBUG] Candidate profile: {candidate_profile}")
+        print(f"[DEBUG] Parsed resume: {parsed_resume}")
+        norm_github_username = extract_github_username(github_username) if github_username else None
+        print(f"[DEBUG] Looking up github_analysis for email={candidate_profile.get('email')}, github_username={norm_github_username}")
         github_analysis = None
-        if github_username:
-            github_analysis = db_operations.fetch_github_analysis_by_candidate(candidate_profile.get('email'), github_username)
+        if norm_github_username:
+            github_analysis = db_operations.fetch_github_analysis_by_candidate(candidate_profile.get('email'), norm_github_username)
         candidate_profile['github_analysis'] = github_analysis
         return candidate_profile
     except Exception as e:
+        print(f"[ERROR] Exception in candidate detail endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 from fastapi import Body

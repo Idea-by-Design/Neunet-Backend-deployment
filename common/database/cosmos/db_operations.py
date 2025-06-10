@@ -278,18 +278,33 @@ def fetch_all_jobs():
         return []
 
 def fetch_candidates_with_github_links():
+    import json
     try:
         query = """
-        SELECT c.email, c.links.gitHub AS github
+        SELECT c.email, c.resume
         FROM c
-        WHERE c.type = 'resume' AND IS_DEFINED(c.links.gitHub)
+        WHERE c.type = 'candidate' AND IS_DEFINED(c.resume)
         """
-        print("Executing query to fetch candidates with GitHub links...")
-        candidates = list(containers[config['database']['resumes_container_name']].query_items(query=query, enable_cross_partition_query=True))
-        print(f"Fetched {len(candidates)} candidates.")
+        print("Executing query to fetch candidates with resumes...")
+        candidates = list(containers[config['database']['application_container_name']].query_items(query=query, enable_cross_partition_query=True))
+        print(f"Fetched {len(candidates)} candidate documents.")
+        results = []
         for candidate in candidates:
-            print(candidate)
-        return candidates
+            email = candidate.get('email')
+            resume_json = candidate.get('resume')
+            if not resume_json:
+                continue
+            try:
+                resume = json.loads(resume_json)
+            except Exception as e:
+                print(f"[WARN] Could not parse resume JSON for {email}: {e}")
+                continue
+            github_link = resume.get('links', {}).get('gitHub')
+            if github_link:
+                results.append({'email': email, 'github': github_link})
+                print(f"[INFO] Found GitHub link for {email}: {github_link}")
+        print(f"Returning {len(results)} candidates with GitHub links.")
+        return results
     except Exception as e:
         print(f"An error occurred while fetching candidates: {e}")
         return []
@@ -297,16 +312,42 @@ def fetch_candidates_with_github_links():
 # --- Candidate-based GitHub Analysis Storage ---
 def upsert_github_analysis(candidate_email, github_identifier, analysis_result):
     """Upsert GitHub analysis for a candidate (by email + github_identifier)"""
+    print(f"[DEBUG] Attempting upsert_github_analysis with candidate_email={candidate_email}, github_identifier={github_identifier}")
+    print(f"[DEBUG] Analysis result: {repr(analysis_result)[:300]}")
     item = {
         "id": f"github_analysis_{candidate_email}_{github_identifier}",
         "candidate_email": candidate_email,
         "github_identifier": github_identifier,
         "type": "github_analysis",
         "result": analysis_result,
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat(),
+        "email": candidate_email  # for partition key compatibility
     }
-    containers[config['database']['github_container_name']].upsert_item(item)
-    print(f"[INFO] GitHub analysis upserted for candidate_email={candidate_email}, github_identifier={github_identifier}")
+    try:
+        # Use email as the partition key for upsert
+        containers[config['database']['github_container_name']].upsert_item(item)
+        print(f"[INFO] GitHub analysis upserted for candidate_email={candidate_email}, github_identifier={github_identifier}")
+    except Exception as e:
+        print(f"[ERROR] Upsert failed: {e}")
+        # If conflict, fetch existing, update, and replace
+        if hasattr(e, 'status_code') and e.status_code == 409:
+            print(f"[DEBUG] Conflict detected. Attempting to update existing record for candidate_email={candidate_email}, github_identifier={github_identifier}")
+            query = (
+                f"SELECT * FROM c WHERE c.type = 'github_analysis' "
+                f"AND c.candidate_email = '{candidate_email}' "
+                f"AND c.github_identifier = '{github_identifier}'"
+            )
+            existing = list(containers[config['database']['github_container_name']].query_items(query=query, enable_cross_partition_query=True))
+            if existing:
+                doc = existing[0]
+                doc['result'] = analysis_result
+                doc['created_at'] = datetime.utcnow().isoformat()
+                containers[config['database']['github_container_name']].replace_item(item=doc, body=doc)
+                print(f"[INFO] Existing GitHub analysis updated for candidate_email={candidate_email}, github_identifier={github_identifier}")
+            else:
+                print(f"[ERROR] Conflict but no existing record found for candidate_email={candidate_email}, github_identifier={github_identifier}")
+        else:
+            raise
 
 def fetch_github_analysis_by_candidate(candidate_email, github_identifier, return_full_item=False):
     """
