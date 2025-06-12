@@ -9,9 +9,29 @@ End-of-day GitHub analysis script.
 """
 import json
 import re
+import sys
 from datetime import datetime, timedelta
 from common.database.cosmos.db_operations import ensure_containers, fetch_github_analysis_by_candidate, upsert_github_analysis
 from services.github_analysis.analyze_github import analyze_github_profile
+
+# --- Logging Setup ---
+import os
+log_date = datetime.now().strftime('%Y%m%d')
+logs_dir = os.path.join(os.path.dirname(__file__), '../logs')
+os.makedirs(logs_dir, exist_ok=True)
+log_path = os.path.join(logs_dir, f'end_of_day_github_analysis_{log_date}.log')
+class TeeLogger:
+    def __init__(self, logfile):
+        self.terminal = sys.stdout
+        self.log = open(logfile, 'a', encoding='utf-8')
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+sys.stdout = TeeLogger(log_path)
+# --- End Logging Setup ---
 
 def extract_github_link(resume):
     """Extract GitHub link from resume JSON or raw text."""
