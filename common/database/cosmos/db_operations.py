@@ -324,7 +324,6 @@ def upsert_github_analysis(candidate_email, github_identifier, analysis_result):
         "email": candidate_email  # for partition key compatibility
     }
     try:
-        # Use email as the partition key for upsert
         containers[config['database']['github_container_name']].upsert_item(item)
         print(f"[INFO] GitHub analysis upserted for candidate_email={candidate_email}, github_identifier={github_identifier}")
     except Exception as e:
@@ -337,12 +336,15 @@ def upsert_github_analysis(candidate_email, github_identifier, analysis_result):
                 f"AND c.candidate_email = '{candidate_email}' "
                 f"AND c.github_identifier = '{github_identifier}'"
             )
+            print(f"[DEBUG] Running fallback query: {query}")
             existing = list(containers[config['database']['github_container_name']].query_items(query=query, enable_cross_partition_query=True))
+            print(f"[DEBUG] Fallback query returned {len(existing)} results: {existing}")
             if existing:
                 doc = existing[0]
+                print(f"[DEBUG] Existing doc id: {doc.get('id')}, partition_key: {doc.get('email')}")
                 doc['result'] = analysis_result
                 doc['created_at'] = datetime.utcnow().isoformat()
-                containers[config['database']['github_container_name']].replace_item(item=doc, body=doc)
+                containers[config['database']['github_container_name']].replace_item(item=doc['id'], partition_key=doc['email'], body=doc)
                 print(f"[INFO] Existing GitHub analysis updated for candidate_email={candidate_email}, github_identifier={github_identifier}")
             else:
                 print(f"[ERROR] Conflict but no existing record found for candidate_email={candidate_email}, github_identifier={github_identifier}")
