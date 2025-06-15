@@ -39,6 +39,10 @@ class GitHubAnalysisRequest(BaseModel):
 
 import uuid
 
+# Import send_email function from chatbot
+from services.chatbot.functions import send_email
+
+
 # --- Helper functions for async GitHub analysis ---
 # Deprecated: No longer used. GitHub analysis is now stored per candidate and GitHub identifier.
 def save_github_analysis_result(*args, **kwargs):
@@ -686,6 +690,27 @@ def generate_job_description(request: JobDescriptionRequest):
         raise HTTPException(status_code=500, detail="AI did not return valid JSON. Please try again or check the prompt.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Email Sending Endpoint ---
+from pydantic import BaseModel
+from fastapi import APIRouter
+
+class SendEmailRequest(BaseModel):
+    to: list[str]
+    subject: str
+    body: str
+
+@app.post("/api/send-email")
+async def api_send_email(request: SendEmailRequest):
+    try:
+        # Call the backend email sender
+        result = send_email(request.to, request.subject, request.body)
+        if result.get("status") == "success":
+            return {"success": True, "details": result.get("details")}
+        else:
+            return {"success": False, "error": result.get("details")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
