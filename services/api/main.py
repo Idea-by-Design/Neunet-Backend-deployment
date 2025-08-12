@@ -906,7 +906,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
         try:
             while True:
                 data = await websocket.receive_text()
-                logging.info(f"[WebSocket] Received message: {data}")
+                logging.info(f"[WebSocket] Received message: {data}")  # Log every message received from client
                 await websocket.send_text(f"Echo: {data}")
         except Exception as e:
             logging.error(f"[WebSocket] Error in receive loop: {e}")
