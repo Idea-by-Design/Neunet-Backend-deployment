@@ -250,20 +250,109 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
         FROM c
         WHERE c.job_id = '{job_id}'
         """
-        
         candidates = list(containers[config['database']['application_container_name']].query_items(
             query=query,
             enable_cross_partition_query=True
         ))
-        
+        print("RAW CANDIDATES:", candidates)  # Debug print
         # Filter out incomplete candidates (missing resume_blob_name)
         valid_candidates = [c for c in candidates if c.get('resume_blob_name')]
+        print("VALID CANDIDATES:", valid_candidates)  # Debug print
         print(f"Found {len(valid_candidates)} valid candidates for job {job_id}")
-        return valid_candidates
-        
+
+        # Fetch rankings for this job
+        rankings = fetch_candidate_rankings(job_id)
+        # Attach ranking and ensure job_id/candidate_id for each candidate
+        for c in valid_candidates:
+            email = c.get('email') or c.get('candidate_email')
+            ranking_info = rankings.get(email, {})
+            c['ranking'] = ranking_info.get('ranking', c.get('ranking', None))
+            c['job_id'] = c.get('job_id', job_id)
+            if not c.get('candidate_id'):
+                # Try to extract from id if possible
+                if c.get('id') and '_' in c['id']:
+                    c['candidate_id'] = c['id'].split('_', 1)[-1]
+        # Sort by ranking descending, fallback to original order if no ranking
+        sorted_candidates = sorted(valid_candidates, key=lambda x: x.get('ranking', 0), reverse=True)
+        # Limit to top_k
+        top_candidates = sorted_candidates[:top_k]
+        print(f"Returning top {top_k} candidates for job {job_id}")
+        import json
+        return json.dumps(top_candidates)
     except Exception as e:
         print(f"An error occurred while fetching candidates: {e}")
         return []
+
+def get_candidate_id_by_email(job_id, email):
+    """
+    Given a job_id and candidate email, return the candidate_id (UUID) if found, else None.
+    """
+    try:
+        query = f"SELECT * FROM c WHERE c.job_id = '{job_id}' AND c.email = '{email}'"
+        candidates = list(containers[config['database']['application_container_name']].query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+        if candidates:
+            candidate = candidates[0]
+            # Prefer the candidate_id field, else extract from id
+            if candidate.get('candidate_id'):
+                return candidate['candidate_id']
+            elif candidate.get('id') and '_' in candidate['id']:
+                parts = candidate['id'].split('_')
+                # Use last part if it looks like a UUID
+                if len(parts) > 1 and len(parts[-1]) > 20:
+                    return parts[-1]
+        return None
+    except Exception as e:
+        print(f"Error in get_candidate_id_by_email: {e}")
+        return None
+
+def fetch_top_k_candidates_by_percentage(job_id, top_percent=0.1):
+    """
+    Fetch the top X% of candidates for a given job_id.
+    :param job_id: str, the job to query for
+    :param top_percent: float, e.g. 0.1 for top 10%
+    :return: list of candidate dicts
+    """
+    try:
+        # Fetch all valid candidates for the job
+        candidates = fetch_top_k_candidates_by_count(job_id, top_k=10000)
+        if not candidates:
+            return []
+        # Calculate how many candidates to return
+        count = max(1, int(len(candidates) * top_percent))
+        # Optionally, sort candidates by a ranking score if available
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda c: c.get('ranking', 0),
+            reverse=True
+        )
+        return sorted_candidates[:count]
+    except Exception as e:
+        print(f"An error occurred in fetch_top_k_candidates_by_percentage: {e}")
+        return []
+
+def update_application_status(job_id, candidate_id, new_status):
+    """
+    Update the application status for a candidate in a given job.
+    """
+    try:
+        container = containers[config['database']['application_container_name']]
+        query = f"SELECT * FROM c WHERE c.job_id = '{job_id}' AND c.candidate_id = '{candidate_id}'"
+        items = list(container.query_items(query=query, enable_cross_partition_query=True))
+        if not items:
+            print(f"No application found for job_id={job_id} and candidate_id={candidate_id}")
+            return False
+        application = items[0]
+        application['application_status'] = new_status
+        application['status'] = new_status  # in case both are used
+        container.replace_item(item=application['id'], body=application)
+        print(f"Updated application status for job_id={job_id}, candidate_id={candidate_id} to '{new_status}'")
+        return True
+    except Exception as e:
+        print(f"Error updating application status: {e}")
+        return False
 
 def fetch_all_jobs():
     try:

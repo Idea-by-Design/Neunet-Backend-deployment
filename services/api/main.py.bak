@@ -273,10 +273,6 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
         rankings_map = { (job_id, k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
         patched_candidates = []
         for cand in candidates:
-            if not isinstance(cand, dict):
-                import sys
-                print(f"[SKIP NON-DICT CANDIDATE]: {cand}", file=sys.stderr)
-                continue
             resume = cand.get('parsed_resume') or cand.get('resume')
             cand = dict(cand)
             cand['resume'] = resume
@@ -328,37 +324,9 @@ async def get_job_candidates(job_id: str, top_k: int = 10):
             else:
                 cand['ranking'] = ranking_val
             cand['explanation'] = explanation
-            # Patch social links for frontend rendering
-            links = None
-            if 'parsed_resume' in cand and isinstance(cand['parsed_resume'], dict):
-                links = cand['parsed_resume'].get('links', {})
-            if links:
-                cand['linkedin'] = links.get('linkedIn') or links.get('linkedin') or links.get('LinkedIn')
-                cand['github'] = links.get('gitHub') or links.get('github') or links.get('GitHub')
-            else:
-                cand['linkedin'] = None
-                cand['github'] = None
-            # Remove CosmosDB metadata fields if present
-            for meta_key in ['_rid', '_self', '_etag', '_attachments', '_ts']:
-                cand.pop(meta_key, None)
             patched_candidates.append(cand)
-        from fastapi.encoders import jsonable_encoder
-        try:
-            return jsonable_encoder(patched_candidates)
-        except Exception as ser_err:
-            import json
-            import sys
-            print("[SERIALIZATION ERROR]", file=sys.stderr)
-            print("Patched candidates:", patched_candidates, file=sys.stderr)
-            print("Serialization error:", ser_err, file=sys.stderr)
-            try:
-                json.dumps(patched_candidates)
-            except Exception as json_err:
-                print("json.dumps error:", json_err, file=sys.stderr)
-            raise HTTPException(status_code=500, detail=f"Serialization error: {ser_err}")
+        return patched_candidates
     except Exception as e:
-        import sys
-        print("[CANDIDATE ENDPOINT ERROR]", e, file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/candidates/{candidate_id}")
@@ -770,8 +738,6 @@ import asyncio
 
 # In-memory chat session store for WebSocket chat
 chat_sessions = {}
-agent_threads = {}
-response_queues = {}
 
 # Function to clean up inactive chat sessions after a timeout
 async def cleanup_session_after_timeout(session_id, timeout_seconds):
@@ -785,20 +751,12 @@ async def cleanup_session_after_timeout(session_id, timeout_seconds):
         
         if time_since_active >= timeout_seconds:
             try:
-                # Put the message in the queue for the agent thread to process
-                if session_id in chat_sessions and "input_queue" in chat_sessions[session_id]:
-                    chat_sessions[session_id]["input_queue"].put(data)
-                    logging.info(f"[WebSocket] Added message to queue for processing")
+                # Clean up resources
+                if "input_queue" in chat_sessions[session_id]:
+                    chat_sessions[session_id]["input_queue"].put(None)
                     
-                    # Send an acknowledgment to the client that the message was received
-                    try:
-                        ack_message = json.dumps({"type": "ack", "timestamp": time.time(), "message": "Message received and being processed"})
-                        await websocket.send_text(ack_message)
-                        logging.info(f"[WebSocket] Sent acknowledgment to client")
-                    except Exception as ack_error:
-                        logging.error(f"[WebSocket] Error sending acknowledgment: {str(ack_error)}")
-                else:
-                    logging.error(f"[WebSocket] No input queue found for session {session_id}")
+                # If there's a thread, just leave it to finish
+                # The None message in the queue should trigger shutdown
                 
                 # Remove the session
                 del chat_sessions[session_id]
@@ -812,16 +770,6 @@ async def cleanup_session_after_timeout(session_id, timeout_seconds):
 
 @app.websocket("/ws/chat/{session_id}")
 async def websocket_chat(websocket: WebSocket, session_id: str):
-    # Extract candidate ID from query parameters if present
-    candidate_id = None
-    try:
-        # Get query parameters
-        query_params = websocket.query_params
-        if query_params and "candidateId" in query_params:
-            candidate_id = query_params.get("candidateId")
-            logging.info(f"[WebSocket] Extracted candidateId from query params: {candidate_id}")
-    except Exception as query_err:
-        logging.error(f"[WebSocket] Error extracting query parameters: {str(query_err)}")
     logging.info(f"[WebSocket] New connection attempt: session_id={session_id}")
     
     # Log request headers for debugging
@@ -838,17 +786,8 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             "input_queue": queue.Queue(),
             "history": [],
             "initialized": False,
-            "last_active": time.time(),
-            "connection_state": "CONNECTED",
-            "websocket": websocket,
-            "pending_messages": [],  # Initialize pending messages list
-            "candidate_id": candidate_id  # Store candidate ID in session
+            "last_active": time.time()
         }
-        logging.info(f"[WebSocket] Stored candidateId in session: {candidate_id}")
-    elif candidate_id and ("candidate_id" not in chat_sessions[session_id] or chat_sessions[session_id]["candidate_id"] != candidate_id):
-        # Update candidate ID if it's changed
-        chat_sessions[session_id]["candidate_id"] = candidate_id
-        logging.info(f"[WebSocket] Updated candidateId in session: {candidate_id}")
     
     # Get or create input queue for this session
     if "input_queue" not in chat_sessions[session_id]:
@@ -903,16 +842,376 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
         # Update last active time for the session
         chat_sessions[session_id]["last_active"] = time.time()
     
-        # Agent thread function removed - now processing messages directly in main loop
-
-        # WebSocket timeout is handled by FastAPI automatically
-        logging.info(f"[WebSocket] WebSocket connection established with default timeout")
+        def agent_thread():
+            # Import necessary modules at the beginning of the function to ensure they're in scope
+            import json
+            import asyncio
+            from services.chatbot.multiagent_assistant import chat_step, start_new_chat
             
+            # Start a new chat session if not already started
+            if session_id in chat_sessions and "initialized" not in chat_sessions[session_id]:
+                logging.info(f"[WebSocket] Initializing new agent session for session_id={session_id}")
+                # Pass session_id to start_new_chat if supported, else map manually
+                try:
+                    from services.chatbot.multiagent_assistant import start_new_chat
+                    start_new_chat(session_id)
+                    logging.info(f"[WebSocket] Successfully initialized chat session for {session_id}")
+                except TypeError:
+                    # fallback to legacy signature
+                    try:
+                        start_new_chat()
+                        logging.info(f"[WebSocket] Successfully initialized chat session with legacy signature")
+                    except Exception as init_error:
+                        logging.error(f"[WebSocket] Error initializing chat session: {str(init_error)}")
+                except ImportError as import_err:
+                    logging.error(f"[WebSocket] Failed to import start_new_chat: {str(import_err)}")
+                except Exception as e:
+                    logging.error(f"[WebSocket] Error in start_new_chat: {str(e)}")
+                    logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                
+                chat_sessions[session_id]["initialized"] = True
+                
+            # Import necessary modules at the beginning of the function to avoid scope issues
+            import json
+            import asyncio
+            import traceback
+            import time
+            
+            while True:
+                try:
+                    # Get a message from the queue
+                    message = input_queue.get(block=True)
+                    
+                    # Check if message is None
+                    if message is None:
+                        logging.warning("[WebSocket] Received None message from queue, skipping")
+                        continue
+                        
+                    logging.info(f"[WebSocket] Agent thread processing message from queue: {message[:100] if isinstance(message, str) else str(message)[:100]}...")
+                    
+                    # Process the message
+                    user_message = message
+                    candidate_id = None
+                    message_text = user_message
+                    
+                    try:
+                        # Skip processing for ping/pong messages
+                        if isinstance(user_message, str) and ('"type":"ping"' in user_message or '"type":"pong"' in user_message):
+                            logging.debug(f"[WebSocket] Skipping ping/pong message in agent thread")
+                            continue
+                            
+                        # Check if the message is JSON with context
+                        message_data = json.loads(user_message)
+                        logging.info(f"[WebSocket] Parsed message data: {message_data}")
+                        
+                        # Handle different message formats
+                        if isinstance(message_data, dict):
+                            # Skip processing for ping/pong messages in JSON format
+                            if 'type' in message_data and message_data['type'] in ['ping', 'pong']:
+                                logging.debug(f"[WebSocket] Skipping ping/pong message in agent thread")
+                                continue
+                            
+                            # Handle test messages
+                            if 'test' in message_data and message_data['test'] is True:
+                                logging.info(f"[WebSocket] Received test message: {message_data}")
+                                
+                                # Handle echo test
+                                if 'text' in message_data and message_data['text'] == "__TEST_ECHO__":
+                                    echo_reply = {
+                                        "type": "text",
+                                        "content": "Echo test successful",
+                                        "echo_response": True,
+                                        "timestamp": time.time(),
+                                        "original_message": message_data
+                                    }
+                                    
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        loop.run_until_complete(websocket.send_text(json.dumps(echo_reply)))
+                                        logging.info(f"[WebSocket] Sent echo reply: {echo_reply}")
+                                    except Exception as e:
+                                        logging.error(f"[WebSocket] Error sending echo reply: {str(e)}")
+                                        logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                                    finally:
+                                        loop.close()
+                                    continue
+                                
+                                # Handle direct test
+                                if 'text' in message_data and message_data['text'] == "__DIRECT_TEST__":
+                                    direct_reply = {
+                                        "type": "text",
+                                        "content": "Direct test successful - message received and processed",
+                                        "test_response": True,
+                                        "timestamp": time.time()
+                                    }
+                                    
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        loop.run_until_complete(websocket.send_text(json.dumps(direct_reply)))
+                                        logging.info(f"[WebSocket] Sent direct test reply: {direct_reply}")
+                                    except Exception as e:
+                                        logging.error(f"[WebSocket] Error sending direct test reply: {str(e)}")
+                                        logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                                    finally:
+                                        loop.close()
+                                    continue
+                                
+                            # Format 1: {text: "message", context: {candidateId: "id"}}
+                            if 'text' in message_data:
+                                message_text = message_data['text']
+                                if 'context' in message_data and 'candidateId' in message_data['context']:
+                                    candidate_id = message_data['context']['candidateId']
+                            
+                        context = message_data.get('context', {})
+                        candidate_id = context.get('candidateId') if context else None
+                        
+                        logging.info(f"[WebSocket] Processing message in agent thread: '{message_text[:50]}...' with candidate_id={candidate_id}")
+                        
+                        # Process the message with the AI assistant
+                        try:
+                            from services.chatbot.multiagent_assistant import chat_step
+                            # Pass both message_text and candidate_id to chat_step
+                            reply = chat_step(message_text, candidate_id=candidate_id)
+                            logging.info(f"[WebSocket] Got reply from chat_step: {reply[:100] if reply else 'None'}...")
+                            
+                            # Check if the reply contains candidate information with LinkedIn/GitHub links
+                            try:
+                                reply_json = json.loads(reply)
+                                if "candidateInfo" in reply_json:
+                                    logging.info(f"[WebSocket] Reply contains candidate info with LinkedIn/GitHub links")
+                                    if "resume" in reply_json["candidateInfo"] and "contact" in reply_json["candidateInfo"]["resume"]:
+                                        linkedin = reply_json["candidateInfo"]["resume"]["contact"].get("linkedin")
+                                        github = reply_json["candidateInfo"]["resume"]["contact"].get("github")
+                                        logging.info(f"[WebSocket] LinkedIn: {linkedin}, GitHub: {github}")
+                            except json.JSONDecodeError:
+                                logging.warning(f"[WebSocket] Could not parse reply as JSON to check for candidate info")
+                            except Exception as parse_err:
+                                logging.warning(f"[WebSocket] Error checking for candidate info: {str(parse_err)}")
+                        except ImportError as import_err:
+                            logging.error(f"[WebSocket] Failed to import chat_step: {str(import_err)}")
+                            reply = json.dumps({"type": "text", "content": "Sorry, the AI processing module could not be loaded. Please contact support."})
+                        except Exception as chat_err:
+                            logging.error(f"[WebSocket] Error in chat_step: {str(chat_err)}")
+                            logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                            reply = json.dumps({"type": "text", "content": "Sorry, there was an error processing your message. The AI system is being updated."})
+                            
+                        # If reply is None or empty, provide a fallback response
+                        if not reply:
+                            logging.warning(f"[WebSocket] Empty reply from chat_step, using fallback")
+                            
+                            # Create a fallback response that includes candidate info if available
+                            fallback_response = {
+                                "type": "text", 
+                                "content": f"I received your message: '{message_text}'. The AI processing queue is currently being fixed."
+                            }
+                            
+                            # Include candidate info in the fallback response if we have a candidate_id
+                            if candidate_id:
+                                # Import the database operations module to fetch candidate info
+                                try:
+                                    from services.database import db_operations
+                                    candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                    
+                                    if candidate_data:
+                                        # Extract LinkedIn and GitHub links if available
+                                        linkedin = ""
+                                        github = ""
+                                        
+                                        # Try to get resume data
+                                        if "resume_data" in candidate_data and candidate_data["resume_data"]:
+                                            resume_data = candidate_data["resume_data"]
+                                            
+                                            # Check if it's a string that needs to be parsed
+                                            if isinstance(resume_data, str):
+                                                try:
+                                                    resume_data = json.loads(resume_data)
+                                                except json.JSONDecodeError:
+                                                    logging.warning(f"[WebSocket] Could not parse resume_data as JSON")
+                                            
+                                            # Extract LinkedIn and GitHub using the same logic as in multiagent_assistant.py
+                                            if isinstance(resume_data, dict):
+                                                # Check in contact section
+                                                if "contact" in resume_data and isinstance(resume_data["contact"], dict):
+                                                    linkedin = resume_data["contact"].get("linkedin", "")
+                                                    github = resume_data["contact"].get("github", "")
+                                                
+                                                # Direct properties
+                                                if not linkedin and "linkedin" in resume_data:
+                                                    linkedin = resume_data["linkedin"]
+                                                if not github and "github" in resume_data:
+                                                    github = resume_data["github"]
+                                        
+                                        # Add candidate info to the response
+                                        fallback_response["candidateInfo"] = {
+                                            "id": candidate_id,
+                                            "name": candidate_data.get("name", ""),
+                                            "email": candidate_data.get("email", ""),
+                                            "resume": {
+                                                "contact": {
+                                                    "linkedin": linkedin,
+                                                    "github": github
+                                                }
+                                            }
+                                        }
+                                        logging.info(f"[WebSocket] Added candidate info to fallback response. LinkedIn: {bool(linkedin)}, GitHub: {bool(github)}")
+                                except Exception as e:
+                                    logging.error(f"[WebSocket] Error adding candidate info to fallback response: {str(e)}")
+                            
+                            reply = json.dumps(fallback_response)
+                        
+                        # Send the reply back to the client
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        try:
+                            # Check if reply is already valid JSON
+                            try:
+                                json.loads(reply)
+                                formatted_reply = reply
+                                logging.info(f"[WebSocket] Reply is already valid JSON")
+                            except json.JSONDecodeError:
+                                # If not JSON, wrap it in a text message format
+                                formatted_reply = json.dumps({"type": "text", "content": reply})
+                                logging.info(f"[WebSocket] Wrapped plain text reply in JSON format")
+                                
+                            # Check if WebSocket is still open before sending
+                            try:
+                                # Check if the connection is still open using the proper WebSocketState enum
+                                from starlette.websockets import WebSocketState
+                                
+                                # Store connection state in session for reference
+                                if session_id in chat_sessions:
+                                    chat_sessions[session_id]["connection_state"] = getattr(websocket, "client_state", "UNKNOWN")
+                                
+                                if hasattr(websocket, 'client_state') and websocket.client_state != WebSocketState.CONNECTED:
+                                    logging.warning(f"[WebSocket] Cannot send reply - WebSocket is not connected. State: {websocket.client_state}")
+                                    # Store the message for later delivery if client reconnects
+                                    if session_id in chat_sessions:
+                                        if "pending_messages" not in chat_sessions[session_id]:
+                                            chat_sessions[session_id]["pending_messages"] = []
+                                        chat_sessions[session_id]["pending_messages"].append(formatted_reply)
+                                        logging.info(f"[WebSocket] Stored message for later delivery: {formatted_reply[:50]}...")
+                                else:
+                                    # Send the properly formatted reply
+                                    loop.run_until_complete(websocket.send_text(formatted_reply))
+                                    logging.info(f"[WebSocket] Successfully sent JSON reply to frontend")
+                            except RuntimeError as ws_error:
+                                if "after sending 'websocket.close'" in str(ws_error) or "Cannot call 'send_text' on closed" in str(ws_error):
+                                    logging.warning(f"[WebSocket] Cannot send message - connection already closed: {str(ws_error)}")
+                                    # Store the message for later delivery if client reconnects
+                                    if session_id in chat_sessions:
+                                        if "pending_messages" not in chat_sessions[session_id]:
+                                            chat_sessions[session_id]["pending_messages"] = []
+                                        chat_sessions[session_id]["pending_messages"].append(formatted_reply)
+                                        logging.info(f"[WebSocket] Stored message for later delivery: {formatted_reply[:50]}...")
+                                else:
+                                    raise
+                        except Exception as send_error:
+                            logging.error(f"[WebSocket] Error sending reply to frontend: {str(send_error)}")
+                            logging.error(traceback.format_exc())
+                        finally:
+                            loop.close()
+                            
+                    except Exception as e:
+                        logging.error(f"[WebSocket] Error in agent thread: {str(e)}")
+                        logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                        
+                        # Send error message back to client with candidate info if available
+                        error_response = {
+                            "type": "text", 
+                            "content": f"Sorry, there was an error processing your message. Please try again later."
+                        }
+                        
+                        # Include candidate info in the error response if we have a candidate_id
+                        if candidate_id:
+                            try:
+                                from services.database import db_operations
+                                candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                
+                                if candidate_data:
+                                    # Extract LinkedIn and GitHub links if available
+                                    linkedin = ""
+                                    github = ""
+                                    
+                                    # Try to get resume data
+                                    if "resume_data" in candidate_data and candidate_data["resume_data"]:
+                                        resume_data = candidate_data["resume_data"]
+                                        
+                                        # Check if it's a string that needs to be parsed
+                                        if isinstance(resume_data, str):
+                                            try:
+                                                resume_data = json.loads(resume_data)
+                                            except json.JSONDecodeError:
+                                                logging.warning(f"[WebSocket] Could not parse resume_data as JSON")
+                                        
+                                        # Extract LinkedIn and GitHub using the same logic as in multiagent_assistant.py
+                                        if isinstance(resume_data, dict):
+                                            # Check in contact section
+                                            if "contact" in resume_data and isinstance(resume_data["contact"], dict):
+                                                linkedin = resume_data["contact"].get("linkedin", "")
+                                                github = resume_data["contact"].get("github", "")
+                                            
+                                            # Direct properties
+                                            if not linkedin and "linkedin" in resume_data:
+                                                linkedin = resume_data["linkedin"]
+                                            if not github and "github" in resume_data:
+                                                github = resume_data["github"]
+                                    
+                                    # Add candidate info to the response
+                                    error_response["candidateInfo"] = {
+                                        "id": candidate_id,
+                                        "name": candidate_data.get("name", ""),
+                                        "email": candidate_data.get("email", ""),
+                                        "resume": {
+                                            "contact": {
+                                                "linkedin": linkedin,
+                                                "github": github
+                                            }
+                                        }
+                                    }
+                                    logging.info(f"[WebSocket] Added candidate info to error response. LinkedIn: {bool(linkedin)}, GitHub: {bool(github)}")
+                            except Exception as add_info_error:
+                                logging.error(f"[WebSocket] Error adding candidate info to error response: {str(add_info_error)}")
+                        
+                        error_reply = json.dumps(error_response)
+                        
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        try:
+                            loop.run_until_complete(websocket.send_text(error_reply))
+                        except Exception as send_error:
+                            logging.error(f"[WebSocket] Error sending error reply to frontend: {str(send_error)}")
+                            logging.error(f"[WebSocket] Send error traceback: {traceback.format_exc()}")
+                        finally:
+                            loop.close()
+                except Exception as thread_error:
+                    logging.error(f"[WebSocket] Unexpected error in agent thread: {str(thread_error)}")
+                    logging.error(f"[WebSocket] Thread error traceback: {traceback.format_exc()}")
+                    # Try to continue processing messages
+                    # Add a small delay to avoid tight error loops
+                    time.sleep(1)
+        
+        # Start agent thread if not already running or if previous thread has died
+        thread_needs_restart = False
+        
+        if "thread" not in chat_sessions[session_id]:
+            thread_needs_restart = True
+        elif not chat_sessions[session_id]["thread"].is_alive():
+            logging.warning(f"[WebSocket] Previous agent thread for session_id={session_id} is dead, restarting")
+            thread_needs_restart = True
+            
+        if thread_needs_restart:
+            logging.info(f"[WebSocket] Starting agent thread for session_id={session_id}")
+            t = threading.Thread(target=agent_thread, daemon=True)
+            chat_sessions[session_id]["thread"] = t
+            t.start()
+    
         # Start a background task for ping/pong
         ping_task = None
         
-        from starlette.websockets import WebSocketState
-
         async def ping_pong():
             """Send periodic pings to keep the connection alive"""
             try:
@@ -920,158 +1219,226 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                     await asyncio.sleep(30)  # Send ping every 30 seconds
                     if websocket.client_state == WebSocketState.CONNECTED:
                         try:
-                            ping_message = {"type": "ping", "timestamp": time.time()}
-                            await websocket.send_text(json.dumps(ping_message))
-                            logging.debug(f"[WebSocket] Sent ping message")
+                            import json
+                            ping_message = json.dumps({"type": "ping", "timestamp": time.time()})
+                            await websocket.send_text(ping_message)
+                            logging.debug(f"[WebSocket] Sent ping to client: session_id={session_id}")
                         except Exception as ping_error:
                             logging.error(f"[WebSocket] Error sending ping: {str(ping_error)}")
                             break
                     else:
-                        logging.warning(f"[WebSocket] Connection not active, stopping ping")
+                        logging.warning(f"[WebSocket] Connection state not CONNECTED during ping, current state: {websocket.client_state}")
                         break
-            except Exception as e:
-                logging.error(f"[WebSocket] Error in ping_pong: {str(e)}")
-        
-        # Start the ping task
-        ping_task = asyncio.create_task(ping_pong())
-        
+            except Exception as ping_task_error:
+                logging.error(f"[WebSocket] Error in ping task: {str(ping_task_error)}")
+                
+        # Start the ping/pong background task
+        try:
+            from starlette.websockets import WebSocketState
+            ping_task = asyncio.create_task(ping_pong())
+            logging.info(f"[WebSocket] Started ping/pong background task: session_id={session_id}")
+        except Exception as task_error:
+            logging.error(f"[WebSocket] Error creating ping task: {str(task_error)}")
+            
         try:
             while True:
-                # Wait for messages from the client
-                message = await websocket.receive_text()
-                logging.info(f"[WebSocket] Received user message from frontend: {message[:100]}...")
-                
-                try:
-                    # Parse the incoming message
-                    data = json.loads(message)
-                    
-                    # Handle ping/pong messages
-                    if data.get("type") == "ping":
-                        pong_message = {"type": "pong", "timestamp": time.time()}
-                        await websocket.send_text(json.dumps(pong_message))
-                        continue
-                    elif data.get("type") == "pong":
-                        logging.debug(f"[WebSocket] Received pong from client")
-                        continue
-                    
-                    # Accept both {text: ...} and {type: 'text', content: ...} message formats
-                    user_message = (
-                        data.get("content") or
-                        data.get("text") or
-                        ""
-                    )
-                    user_message = user_message.strip()
-
-                    # Accept context from either format
-                    context = data.get("context", {})
-                    candidate_id = context.get("candidateId") or data.get("candidateId")
-
-                    if not user_message:
-                        logging.warning(f"[WebSocket] Received empty message")
-                        continue
-                    
-                    # Send processing acknowledgment immediately
-                    processing_message = {
-                        "type": "text",
-                        "content": f"I received your message: '{user_message}'. Processing your request...",
-                        "isProcessing": True
-                    }
-                    await websocket.send_text(json.dumps(processing_message))
-                    logging.info(f"[WebSocket] Sent processing acknowledgment")
-                    
-                    # Process the message with multiagent assistant
+                data = await websocket.receive_text()
+                # Handle potential ping/pong messages from client
+                if data.strip().lower() in ["{\"type\":\"ping\"}", "{\"type\":\"pong\"}"]:
+                    logging.debug(f"[WebSocket] Received ping/pong from client: {data}")
                     try:
-                        from services.chatbot.multiagent_assistant import chat_step
+                        await websocket.send_text('{"type":"pong","timestamp":' + str(time.time()) + '}')
+                    except Exception as pong_error:
+                        logging.error(f"[WebSocket] Error sending pong response: {str(pong_error)}")
+                    continue
+                    
+                logging.info(f"[WebSocket] Received user message from frontend: {data[:100]}...")
+                
+                # Check if this is a test message that should be handled directly
+                try:
+                    import json
+                    message_data = json.loads(data)
+                    
+                    # Skip ping/pong messages - don't add them to the queue
+                    if isinstance(message_data, dict) and message_data.get('type') in ['ping', 'pong']:
+                        logging.debug(f"[WebSocket] Skipping ping/pong message: {message_data.get('type')}")
+                        if message_data.get('type') == 'ping':
+                            await websocket.send_text(json.dumps({"type": "pong", "timestamp": time.time()}))
+                            logging.debug(f"[WebSocket] Sent pong response directly")
+                        continue
+                    
+                    # Handle test echo messages directly without queueing
+                    if isinstance(message_data, dict) and message_data.get('test') == True:
+                        logging.info(f"[WebSocket] Detected test message: {message_data}")
                         
-                        # Call chat_step with optional candidate_id
-                        ai_response_json = chat_step(
-                            user_message=user_message,
-                            chat_history=None,
-                            candidate_id=candidate_id
-                        )
-                        
-                        # Parse the JSON response from chat_step
-                        try:
-                            ai_response_data = json.loads(ai_response_json)
-                            
-                            # Add timestamp and metadata to the response
-                            ai_response_data["timestamp"] = time.time()
-                            ai_response_data["isProcessing"] = False
-                            
-                            # Add or update metadata
-                            if "metadata" not in ai_response_data:
-                                ai_response_data["metadata"] = {}
-                            ai_response_data["metadata"].update({
-                                "using_fallback": False,
-                                "using_real_ai_response": True,
-                                "response_source": "multiagent_assistant"
+                        # Handle echo mode test messages
+                        if message_data.get('echo_mode') == True:
+                            logging.info(f"[WebSocket] Processing echo test message directly")
+                            echo_reply = json.dumps({
+                                "type": "text", 
+                                "content": f"ECHO TEST REPLY: Received '{message_data.get('text')}' at {time.time()}"
                             })
+                            await websocket.send_text(echo_reply)
+                            logging.info(f"[WebSocket] Sent echo test reply directly")
+                            continue
                             
-                            # Send the final response directly
-                            await websocket.send_text(json.dumps(ai_response_data))
+                        # Handle direct test messages
+                        elif message_data.get('bypass_queue') == True:
+                            logging.info(f"[WebSocket] Processing direct test message")
+                            direct_reply = json.dumps({
+                                "type": "text", 
+                                "content": f"DIRECT TEST REPLY: Message processing queue bypassed. Original message: '{message_data.get('text')}'"
+                            })
+                            await websocket.send_text(direct_reply)
+                            logging.info(f"[WebSocket] Sent direct test reply")
+                            continue
                             
-                        except json.JSONDecodeError as parse_error:
-                            logging.error(f"[WebSocket] Failed to parse AI response JSON: {str(parse_error)}")
-                            # Fallback: treat as plain text
-                            fallback_response = {
-                                "type": "text",
-                                "content": ai_response_json,
-                                "isProcessing": False,
-                                "timestamp": time.time(),
-                                "metadata": {
-                                    "using_fallback": True,
-                                    "using_real_ai_response": True,
-                                    "response_source": "multiagent_assistant",
-                                    "parse_error": str(parse_error)
-                                }
-                            }
-                            await websocket.send_text(json.dumps(fallback_response))
-                        logging.info(f"[WebSocket] Sent final AI response")
+                    # Handle regular chat messages with direct response for testing
+                    if isinstance(message_data, dict) and 'text' in message_data and isinstance(message_data['text'], str) and not message_data.get('test'):
+                        # For now, add a direct echo response for regular messages to test basic functionality
+                        logging.info(f"[WebSocket] Processing regular chat message directly: {message_data['text'][:50]}...")
                         
-                    except Exception as ai_error:
-                        logging.error(f"[WebSocket] Error in AI processing: {str(ai_error)}")
-                        
-                        # Send error response
-                        error_response = {
+                        # Extract text from different message formats
+                        message_text = message_data['text']
+                        if isinstance(message_text, dict) and 'content' in message_text:
+                            message_text = message_text['content']
+                            
+                        # Send a direct response to acknowledge receipt of the message
+                        direct_response = {
                             "type": "text",
-                            "content": "I'm sorry, I encountered an error processing your request. Please try again.",
-                            "isProcessing": False,
-                            "timestamp": time.time(),
-                            "metadata": {
-                                "error": True,
-                                "error_message": str(ai_error)
-                            }
+                            "content": f"I received your message: '{message_text}'. Processing your request..."
                         }
-                        await websocket.send_text(json.dumps(error_response))
                         
-                except json.JSONDecodeError:
-                    logging.error(f"[WebSocket] Invalid JSON received: {message}")
-                except Exception as msg_error:
-                    logging.error(f"[WebSocket] Error processing message: {str(msg_error)}")
-                    
+                        # Include candidate info in the direct response if we have a candidate_id
+                        if candidate_id:
+                            try:
+                                from services.database import db_operations
+                                candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                
+                                if candidate_data:
+                                    # Extract LinkedIn and GitHub links if available
+                                    linkedin = ""
+                                    github = ""
+                                    
+                                    # Try to get resume data
+                                    if "resume_data" in candidate_data and candidate_data["resume_data"]:
+                                        resume_data = candidate_data["resume_data"]
+                                        
+                                        # Check if it's a string that needs to be parsed
+                                        if isinstance(resume_data, str):
+                                            try:
+                                                resume_data = json.loads(resume_data)
+                                            except json.JSONDecodeError:
+                                                logging.warning(f"[WebSocket] Could not parse resume_data as JSON")
+                                        
+                                        # Extract LinkedIn and GitHub using the same logic as in multiagent_assistant.py
+                                        if isinstance(resume_data, dict):
+                                            # Check in contact section
+                                            if "contact" in resume_data and isinstance(resume_data["contact"], dict):
+                                                linkedin = resume_data["contact"].get("linkedin", "")
+                                                github = resume_data["contact"].get("github", "")
+                                            
+                                            # Direct properties
+                                            if not linkedin and "linkedin" in resume_data:
+                                                linkedin = resume_data["linkedin"]
+                                            if not github and "github" in resume_data:
+                                                github = resume_data["github"]
+                                    
+                                    # Add candidate info to the direct response
+                                    direct_response["candidateInfo"] = {
+                                        "id": candidate_id,
+                                        "name": candidate_data.get("name", ""),
+                                        "email": candidate_data.get("email", ""),
+                                        "resume": {
+                                            "contact": {
+                                                "linkedin": linkedin,
+                                                "github": github
+                                            }
+                                        }
+                                    }
+                                    logging.info(f"[WebSocket] Added candidate info to direct response. LinkedIn: {bool(linkedin)}, GitHub: {bool(github)}")
+                            except Exception as e:
+                                logging.error(f"[WebSocket] Error adding candidate info to direct response: {str(e)}")
+                        
+                        await websocket.send_text(json.dumps(direct_response))
+                        logging.info(f"[WebSocket] Sent simple acknowledgment for regular message")
+                        # Still add to queue for normal processing
+                        logging.info(f"[WebSocket] Also adding message to queue for normal processing")
+                        input_queue.put(data)
+                        continue
+                except Exception as test_error:
+                    logging.error(f"[WebSocket] Error handling test message: {str(test_error)}")
+                
+                # Normal message processing - add to queue
+                input_queue.put(data)
+                # Add a debug message to confirm the message was added to the queue
+                logging.info(f"[WebSocket] Added message to queue: {data[:100]}...")
+                
+                # Update last active time
+                chat_sessions[session_id]["last_active"] = time.time()
         except WebSocketDisconnect as disconnect_error:
-            logging.info(f"[WebSocket] WebSocket disconnected during message loop: {str(disconnect_error)}")
-        except Exception as loop_error:
-            logging.error(f"[WebSocket] Error in message loop: {str(loop_error)}")
-                    
-    except WebSocketDisconnect:
-        logging.info(f"[WebSocket] Client disconnected from session {session_id}")
-    except Exception as e:
-        logging.error(f"[WebSocket] WebSocket error: {str(e)}")
-    finally:
-        # Clean up
-        if ping_task:
-            ping_task.cancel()
-        if session_id in chat_sessions:
-            chat_sessions[session_id]["last_active"] = time.time()
-        logging.info(f"[WebSocket] WebSocket connection closed for session {session_id}")
-
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": time.time()}
-
+            logging.warning(f"[WebSocket] Client disconnected: {str(disconnect_error)}")
+            logging.warning(f"[WebSocket] Disconnect code: {getattr(disconnect_error, 'code', 'unknown')}")
+            logging.warning(f"[WebSocket] Disconnect reason: {getattr(disconnect_error, 'reason', 'unknown')}")
+            # Clean up resources for this session
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+                
+        except ConnectionRefusedError as conn_error:
+            logging.error(f"[WebSocket] Connection refused: {str(conn_error)}")
+            logging.error(f"[WebSocket] This may indicate the server is not accepting WebSocket connections")
+            # Clean up resources for this session
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+                
+        except ConnectionResetError as reset_error:
+            logging.error(f"[WebSocket] Connection reset by peer: {str(reset_error)}")
+            logging.error(f"[WebSocket] This may indicate network issues or client abruptly closed connection")
+            # Clean up resources for this session
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+                
+        except Exception as e:
+            logging.error(f"[WebSocket] Error in websocket handler: {str(e)}")
+            logging.error(f"[WebSocket] Error type: {type(e).__name__}")
+            logging.error(traceback.format_exc())
+            # Clean up resources for this session
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+            # Try to send an error message back to the client
+            try:
+                import json
+                error_message = json.dumps({"type": "text", "content": f"Server error: {str(e)}. Please try again."})
+                await websocket.send_text(error_message)
+            except Exception as send_error:
+                logging.error(f"[WebSocket] Could not send error message to client: {str(send_error)}")
+            input_queue.put(None)
+        finally:
+            # Clean up the ping task if it exists
+            if ping_task is not None:
+                try:
+                    ping_task.cancel()
+                    logging.info(f"[WebSocket] Canceled ping task for session_id={session_id}")
+                except Exception as cancel_error:
+                    logging.error(f"[WebSocket] Error canceling ping task: {str(cancel_error)}")
+            
+            # Don't delete the session immediately to allow reconnecting
+            # Just mark it as inactive by updating the timestamp
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+                logging.info(f"[WebSocket] Updated last_active for session_id={session_id}")
+                
+            # Schedule session cleanup after timeout
+            asyncio.create_task(cleanup_session_after_timeout(session_id, 3600))  # 1 hour timeout
+    except Exception as connection_error:
+        logging.error(f"[WebSocket] Connection error: {str(connection_error)}")
+        # We can't send a message to the client if the connection failed
+        try:
+            # Explicitly import json here to avoid the variable scope issue
+            import json
+            logging.info(f"[WebSocket] Connection error handled with json module")
+        except Exception as import_error:
+            logging.error(f"[WebSocket] Error importing json: {str(import_error)}")
 
 if __name__ == "__main__":
     import uvicorn

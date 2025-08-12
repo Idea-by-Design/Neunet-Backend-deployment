@@ -1,0 +1,1827 @@
+print("=== LOADING main.py ===")
+from fastapi import FastAPI, HTTPException, File, UploadFile, Depends, Form, BackgroundTasks, Request, Response, status
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+import random
+import os
+import sys
+import tempfile
+import json
+import uuid
+import time
+import asyncio
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Add the project root to Python path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from common.database.cosmos import db_operations
+from azure.storage.blob import BlobServiceClient
+import io
+
+app = FastAPI(title="Neunet Recruitment API")
+
+# --- CORS Middleware (must be before endpoints) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+# --- Health Check Endpoint ---
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for frontend to verify backend availability"""
+    return {"status": "ok", "timestamp": time.time()}
+
+# --- GitHub Analysis Endpoint ---
+from services.github_analysis.analyze_github import analyze_github_profile
+from fastapi import Body
+from pydantic import BaseModel
+
+class GitHubAnalysisRequest(BaseModel):
+    github_identifier: str
+    candidate_email: str
+
+import uuid
+
+# Import send_email function from chatbot
+from services.chatbot.functions import send_email
+
+
+# --- Helper functions for async GitHub analysis ---
+# Deprecated: No longer used. GitHub analysis is now stored per candidate and GitHub identifier.
+def save_github_analysis_result(*args, **kwargs):
+    pass  # No-op for backward compatibility if called elsewhere.
+
+def fetch_github_analysis_result(candidate_email, github_identifier):
+    return db_operations.fetch_github_analysis_by_candidate(candidate_email, github_identifier)
+
+@app.post("/api/github-analysis")
+async def github_analysis(request: GitHubAnalysisRequest = Body(...), background_tasks: BackgroundTasks = None):
+    import dateutil.parser
+    from datetime import datetime, timedelta
+    existing_full = db_operations.fetch_github_analysis_by_candidate(request.candidate_email, request.github_identifier, return_full_item=True)
+    if existing_full is not None:
+        created_at = existing_full.get("created_at")
+        is_fresh = False
+        if created_at:
+            try:
+                created_dt = dateutil.parser.isoparse(created_at)
+                now = datetime.now(created_dt.tzinfo) if created_dt.tzinfo else datetime.utcnow()
+                is_fresh = (now - created_dt) < timedelta(days=183)
+            except Exception as e:
+                print(f"[WARN] Could not parse created_at for github analysis: {e}")
+        if is_fresh:
+            return {"success": True, "data": existing_full["result"], "cached": True, "age_days": (now - created_dt).days}
+    def run_analysis_and_save():
+        try:
+            result = analyze_github_profile(request.github_identifier, request.candidate_email)
+            db_operations.upsert_github_analysis(request.candidate_email, request.github_identifier, result)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    if background_tasks is not None:
+        background_tasks.add_task(run_analysis_and_save)
+        return {"success": False, "status": "processing"}
+    else:
+        run_analysis_and_save()
+        # Return latest result after sync
+        latest_full = db_operations.fetch_github_analysis_by_candidate(request.candidate_email, request.github_identifier, return_full_item=True)
+        if latest_full:
+            return {"success": True, "data": latest_full["result"], "cached": False}
+        else:
+            return {"success": False, "error": "Analysis failed or not found."}
+
+@app.get("/api/github-analysis/result/{candidate_email}/{github_identifier}")
+async def github_analysis_result(candidate_email: str, github_identifier: str):
+    result = db_operations.fetch_github_analysis_by_candidate(candidate_email, github_identifier)
+    if result is None:
+        return {"status": "processing"}
+    return {"success": True, "data": result}
+
+# ------------------- Resume Parser Endpoint -------------------
+from services.resume_parser.parser.openai_resume_parser import parse_resume_json
+from services.resume_parser.parser.pdf_parser import parse_pdf
+from services.resume_parser.parser.doc_parser import parse_doc
+
+@app.post("/api/parse-resume")
+async def parse_resume(file: UploadFile = File(...)):
+    import shutil, tempfile, os
+    suffix = os.path.splitext(file.filename)[-1].lower()
+    fd, temp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)  # Close the file descriptor immediately
+    try:
+        with open(temp_path, "wb") as out_file:
+            shutil.copyfileobj(file.file, out_file)
+        await file.close()
+        import os
+        print(f"[DEBUG] temp_path: {temp_path}")
+        print(f"[DEBUG] os.getcwd(): {os.getcwd()}")
+        if suffix == '.pdf':
+            text, hyperlinks = parse_pdf(temp_path)
+        elif suffix in ['.doc', '.docx']:
+            text, hyperlinks = parse_doc(temp_path)
+        else:
+            return {"success": False, "data": None, "error": "Unsupported file format. Please upload PDF or DOCX."}
+        extracted_info = parse_resume_json(text, hyperlinks)
+        return {"success": True, "data": extracted_info, "error": None}
+    except Exception as e:
+        return {"success": False, "data": None, "error": str(e)}
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+# --- Job Endpoints ---
+class JobQuestionnaire(BaseModel):
+    questions: List[str]
+
+class JobDescription(BaseModel):
+    title: str
+    location: str
+    job_type: str
+    description: str
+    requirements: str
+    responsibilities: str
+    salary_range: str
+    benefits: Optional[str] = None
+    company_culture: Optional[str] = None
+    interview_process: Optional[str] = None
+    growth_opportunities: Optional[str] = None
+    tech_stack: Optional[str] = None
+    questionnaire: Optional[JobQuestionnaire] = None
+    job_id: str = Field(default_factory=lambda: str(random.randint(100000, 999999)))
+    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+
+    @validator('job_id')
+    def validate_job_id(cls, v):
+        if not (len(v) == 6 and v.isdigit()):
+            raise ValueError('job_id must be a 6-digit number')
+        return v
+
+@app.get("/jobs/")
+async def list_jobs():
+    try:
+        jobs = db_operations.fetch_all_jobs()
+        return jobs if jobs else []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/jobs/")
+async def create_job(job: JobDescription, background_tasks: BackgroundTasks):
+    try:
+        # Generate a new 6-digit job ID if not provided
+        if not job.job_id:
+            job.job_id = str(random.randint(100000, 999999))
+        
+        job_data = job.dict()
+        job_data["id"] = job_data["job_id"]  # Ensure id is set for Cosmos DB
+        
+        print("Creating job with data:", job_data)  # Debug log
+        
+        # Store in Cosmos DB
+        db_operations.upsert_jobDetails(job_data)
+
+        # Trigger questionnaire generation as a background task
+        background_tasks.add_task(generate_and_store_questionnaire, job.job_id)
+
+        return {"message": "Job created successfully", "job_id": job.job_id}
+    except Exception as e:
+        print(f"Error creating job: {e}")  # Debug log
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Background Task for Questionnaire Generation ---
+def generate_and_store_questionnaire(job_id):
+    try:
+        from services.resume_ranking.job_description_questionnaire.jd_questionnaire_generator import generate_questionnaire
+        from common.database.cosmos.db_operations import fetch_job_description, store_job_questionnaire, upsert_jobDetails
+        import json
+        import datetime
+        job_description = fetch_job_description(job_id)
+        if not job_description:
+            print(f"[ERROR] Could not fetch job description for job_id: {job_id}")
+            return
+        print(f"[INFO] Generating questionnaire for job_id: {job_id}")
+        raw_response = generate_questionnaire(job_description)
+        start_idx = raw_response.find("{")
+        end_idx = raw_response.rfind("}")
+        try:
+            json_data = json.loads(raw_response[start_idx:end_idx+1])
+        except Exception as e:
+            print(f"[ERROR] Failed to parse questionnaire JSON: {e}")
+            return
+        json_data['job_id'] = job_id
+        current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        unique_id = f"{job_id}_{current_time}"
+        json_data['id'] = unique_id
+        store_job_questionnaire(json_data)
+        # Optionally, attach questionnaire to job record
+        job_description['questionnaire'] = json_data
+        upsert_jobDetails(job_description)
+        print(f"[INFO] Questionnaire generated and stored for job_id: {job_id}")
+    except Exception as e:
+        print(f"[ERROR] Exception in background questionnaire generation: {e}")
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    try:
+        job = db_operations.fetch_job_description(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+    except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/jobs/{job_id}/questionnaire")
+async def get_job_questionnaire(job_id: str):
+    try:
+        job = db_operations.fetch_job_description(job_id)
+        if job and job.get("questionnaire"):
+            return job["questionnaire"]
+        # If not found in job document, look in jobDescriptionQuestionnaire container
+        questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+        if questionnaire_doc and questionnaire_doc.get("questionnaire"):
+            return questionnaire_doc["questionnaire"]
+        raise HTTPException(status_code=404, detail="Questionnaire not found")
+    except Exception as e:
+        import traceback
+        print("=== EXCEPTION OCCURRED ===")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Candidate Endpoints ---
+@app.get("/jobs/{job_id}/candidates")
+async def get_job_candidates(job_id: str, top_k: int = 10):
+    try:
+        candidates = db_operations.fetch_top_k_candidates_by_count(job_id, top_k)
+        if not candidates:
+            return []
+        rankings_map = { (job_id, k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
+        patched_candidates = []
+        for cand in candidates:
+            resume = cand.get('parsed_resume') or cand.get('resume')
+            cand = dict(cand)
+            cand['resume'] = resume
+            # Ensure 'status' is always present
+            if 'status' not in cand or not cand['status']:
+                if 'application_status' in cand and cand['application_status']:
+                    cand['status'] = cand['application_status']
+                else:
+                    cand['status'] = 'applied'
+            email = (cand.get('email') or '').strip().lower()
+            from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+            import re
+            # If ranking is missing or zero, re-run ranking synchronously
+            ranking_val = 0
+            explanation = None
+            if email and (job_id, email) in rankings_map:
+                raw_ranking = rankings_map[(job_id, email)].get('ranking', 0)
+                explanation = rankings_map[(job_id, email)].get('explanation', None)
+                if isinstance(raw_ranking, (float, int)) and 0 < raw_ranking <= 1:
+                    ranking_val = round(raw_ranking * 100)
+                else:
+                    ranking_val = round(raw_ranking)
+            if ranking_val == 0:
+                # Try to re-rank synchronously
+                job_description = db_operations.fetch_job_description(job_id)
+                job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+                job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
+                questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
+                job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
+                resume_text = ''
+                parsed_resume = cand.get('parsed_resume')
+                if parsed_resume and isinstance(parsed_resume, dict) and 'raw_text' in parsed_resume:
+                    resume_text = parsed_resume['raw_text']
+                if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
+                    try:
+                        ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
+                        if isinstance(ranking_result, dict) and 'score' in ranking_result:
+                            ranking_val = ranking_result['score']
+                        elif isinstance(ranking_result, (int, float)):
+                            ranking_val = ranking_result
+                        elif isinstance(ranking_result, str):
+                            match = re.search(r"([0-9]+\.?[0-9]*)", ranking_result)
+                            if match:
+                                ranking_val = float(match.group(1))
+                        cand['ranking'] = ranking_val
+                        db_operations.upsert_candidate(cand)
+                    except Exception as e:
+                        print(f"[ERROR] Failed to rerank candidate {email}: {e}")
+            else:
+                cand['ranking'] = ranking_val
+            cand['explanation'] = explanation
+            # Patch social links for frontend rendering
+            links = None
+            if 'parsed_resume' in cand and isinstance(cand['parsed_resume'], dict):
+                links = cand['parsed_resume'].get('links', {})
+            if links:
+                cand['linkedin'] = links.get('linkedIn') or links.get('linkedin') or links.get('LinkedIn')
+                cand['github'] = links.get('gitHub') or links.get('github') or links.get('GitHub')
+            else:
+                cand['linkedin'] = None
+                cand['github'] = None
+            # Remove CosmosDB metadata fields if present
+            for meta_key in ['_rid', '_self', '_etag', '_attachments', '_ts']:
+                cand.pop(meta_key, None)
+            patched_candidates.append(cand)
+        from fastapi.encoders import jsonable_encoder
+        try:
+            return jsonable_encoder(patched_candidates)
+        except Exception as ser_err:
+            import json
+            import sys
+            print("[SERIALIZATION ERROR]", file=sys.stderr)
+            print("Patched candidates:", patched_candidates, file=sys.stderr)
+            print("Serialization error:", ser_err, file=sys.stderr)
+            try:
+                json.dumps(patched_candidates)
+            except Exception as json_err:
+                print("json.dumps error:", json_err, file=sys.stderr)
+            raise HTTPException(status_code=500, detail=f"Serialization error: {ser_err}")
+    except Exception as e:
+        import sys
+        print("[CANDIDATE ENDPOINT ERROR]", e, file=sys.stderr)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/candidates/{candidate_id}")
+async def get_candidate_by_id(candidate_id: str):
+    try:
+        applications_by_id = db_operations.fetch_applications_by_candidate(candidate_id) or []
+        applications_by_email = db_operations.fetch_applications_by_candidate_email(candidate_id) or []
+        seen = set()
+        all_applications = []
+        for app in applications_by_id + applications_by_email:
+            key = (app.get('job_id'), app.get('email'))
+            if key not in seen:
+                seen.add(key)
+                all_applications.append(app)
+        if not all_applications:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        profile_fields = [
+            'name', 'email', 'avatar', 'role', 'evaluation', 'github', 'skills', 'resume', 'resume_blob_name', 'cover_letter', 'ranking'
+        ]
+        candidate_profile = {k: all_applications[0].get(k) for k in profile_fields if k in all_applications[0]}
+        jobs_applied = []
+        for app in all_applications:
+            job_id = app.get('job_id')
+            job_title = app.get('job_title')
+            email = app.get('email')
+            if not job_title and job_id:
+                job_desc = db_operations.fetch_job_description(job_id)
+                job_title = job_desc['title'] if job_desc and 'title' in job_desc else job_id
+            ranking = 0.0
+            explanation = None
+            if job_id and email:
+                rmap = db_operations.fetch_candidate_rankings(job_id)
+                if email in rmap:
+                    ranking = rmap[email].get('ranking', 0.0)
+                    explanation = rmap[email].get('explanation')
+            jobs_applied.append({
+                'job_id': job_id,
+                'title': job_title,
+                'status': app.get('status'),
+                'applied_at': app.get('applied_at'),
+                'ranking': ranking,
+                'explanation': explanation,
+                'resume_blob_name': app.get('resume_blob_name'),
+                'score': app.get('score') or ranking,
+            })
+        candidate_profile['jobsApplied'] = jobs_applied
+        candidate_profile['ranking'] = max([j['ranking'] for j in jobs_applied] or [0.0])
+        parsed_resume = None
+        if 'parsed_resume' in all_applications[0] and isinstance(all_applications[0]['parsed_resume'], dict):
+            parsed_resume = all_applications[0]['parsed_resume']
+            candidate_profile['parsed_resume'] = parsed_resume
+        elif 'resume' in all_applications[0] and isinstance(all_applications[0]['resume'], dict):
+            parsed_resume = all_applications[0]['resume']
+            candidate_profile['parsed_resume'] = parsed_resume
+        if parsed_resume and parsed_resume.get('skills'):
+            candidate_profile['skills'] = parsed_resume['skills']
+        candidate_profile['candidate_id'] = all_applications[0].get('candidate_id') or all_applications[0].get('email')
+
+        # --- Use parsed_resume if present, else parse resume JSON ---
+        import json
+        parsed_resume = candidate_profile.get('parsed_resume')
+        if not parsed_resume:
+            resume_str = candidate_profile.get('resume')
+            if resume_str:
+                try:
+                    parsed_resume = json.loads(resume_str)
+                except Exception as e:
+                    print(f"[ERROR] Failed to parse resume JSON for {candidate_profile.get('email')}: {e}")
+
+        # --- GitHub Analysis Section ---
+        import re
+        def extract_github_username(github_url_or_username):
+            if not github_url_or_username:
+                return None
+            match = re.search(r"github\.com/([A-Za-z0-9_.-]+)", github_url_or_username)
+            if match:
+                return match.group(1)
+            return github_url_or_username.strip()
+
+        github_username = None
+        if parsed_resume:
+            links = parsed_resume.get('links', {})
+            github_username = (
+                links.get('gitHub') or links.get('github') or links.get('GitHub') or
+                parsed_resume.get('github') or parsed_resume.get('GitHub')
+            )
+        # Fallback: check jobsApplied
+        if not github_username and candidate_profile.get('jobsApplied'):
+            for job in candidate_profile['jobsApplied']:
+                if job.get('github'):
+                    github_username = job['github']
+                    break
+
+        # Extra debug logging for diagnosis
+        print(f"[DEBUG] Candidate profile: {candidate_profile}")
+        print(f"[DEBUG] Parsed resume: {parsed_resume}")
+        norm_github_username = extract_github_username(github_username) if github_username else None
+        print(f"[DEBUG] Looking up github_analysis for email={candidate_profile.get('email')}, github_username={norm_github_username}")
+        github_analysis = None
+        if norm_github_username:
+            github_analysis = db_operations.fetch_github_analysis_by_candidate(candidate_profile.get('email'), norm_github_username)
+        candidate_profile['github_analysis'] = github_analysis
+        return candidate_profile
+    except Exception as e:
+        print(f"[ERROR] Exception in candidate detail endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+from fastapi import Body
+
+@app.post("/jobs/{job_id}/candidates/{candidate_id}/status")
+async def update_candidate_status(job_id: str, candidate_id: str, data: dict = Body(...)):
+    try:
+        status = data.get("status")
+        db_operations.update_candidate_status_by_id(job_id, candidate_id, status)
+        return {"message": "Status updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/candidates/{job_id}/{email}/resume")
+async def get_candidate_resume(job_id: str, email: str):
+    try:
+        candidate = db_operations.fetch_resume_with_email_and_job(job_id, email)
+        if not candidate or "resume_blob_name" not in candidate:
+            raise HTTPException(status_code=404, detail="Resume not found")
+        blob_name = candidate["resume_blob_name"]
+        AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        CONTAINER_NAME = "resumes"
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+        blob_client = container_client.get_blob_client(blob_name)
+        stream = io.BytesIO()
+        blob_data = blob_client.download_blob()
+        blob_data.readinto(stream)
+        stream.seek(0)
+        return StreamingResponse(stream, media_type="application/pdf", headers={
+            "Content-Disposition": f"attachment; filename={os.path.basename(blob_name)}"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Application Endpoints ---
+@app.get("/applications/{job_id}")
+async def get_job_applications(job_id: str):
+    try:
+        applications = db_operations.fetch_application_by_job_id(job_id)
+        if not applications:
+            return []
+        return applications
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/jobs/{job_id}/apply")
+async def apply_for_job(
+    job_id: str,
+    name: str = Form(...),
+    email: str = Form(...),
+    cover_letter: str = Form(None),
+    ranking: float = Form(0.0),
+    resume: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    try:
+        if resume is None:
+            raise HTTPException(status_code=400, detail="No resume file provided.")
+        if not hasattr(resume, 'filename') or resume.filename is None:
+            raise HTTPException(status_code=400, detail="Resume filename is missing.")
+        AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+        CONTAINER_NAME = "resumes"
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+        ext = os.path.splitext(resume.filename)[-1]
+        timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+        blob_name = f"{email}_{timestamp}{ext}"
+        blob_client = container_client.get_blob_client(blob_name)
+        data = await resume.read()
+        if data is None or len(data) == 0:
+            raise HTTPException(status_code=400, detail="Resume file is empty.")
+        try:
+            blob_client.upload_blob(data, overwrite=True)
+            resume_blob_name = blob_name
+        except Exception as upload_exc:
+            resume_blob_name = None
+        parsed_resume = None
+        if not resume_blob_name:
+            raise HTTPException(status_code=500, detail="Resume upload failed. Please try again.")
+        try:
+            suffix = os.path.splitext(resume.filename)[-1].lower()
+            fd, temp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+            with open(temp_path, "wb") as out_file:
+                out_file.write(data)
+            if suffix == '.pdf':
+                text, hyperlinks = parse_pdf(temp_path)
+            elif suffix in ['.doc', '.docx']:
+                text, hyperlinks = parse_doc(temp_path)
+            else:
+                text, hyperlinks = '', []
+            print(f"[DEBUG] Uploaded file: {resume.filename}, suffix: {suffix}")
+            print(f"[DEBUG] Parsed resume_text length: {len(text) if text else 0}")
+            if not text or not str(text).strip():
+                print(f"[ERROR] Resume parsing failed or resume is empty for file: {resume.filename}")
+                raise HTTPException(status_code=400, detail="Resume could not be parsed. Please upload a valid PDF or DOCX file with readable text.")
+            try:
+                parsed_resume = parse_resume_json(text, hyperlinks)
+            except Exception as e:
+                print(f"[ERROR] Failed to parse resume JSON: {e}")
+                parsed_resume = None
+        finally:
+            try:
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+        job_description = db_operations.fetch_job_description(job_id)
+        job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+        job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
+        questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
+        resume_text = text if 'text' in locals() else ''
+        job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
+        ranking_score = ranking
+        explanation = None
+        print("[DEBUG] Ranking eligibility check:")
+        print(f"  job_id: {job_id} (type: {type(job_id)})")
+        print(f"  job_questionnaire_id: {job_questionnaire_id} (type: {type(job_questionnaire_id)})")
+        print(f"  resume_text: {repr(resume_text)[:100]} (type: {type(resume_text)})")
+        print(f"  job_description_text: {repr(job_description_text)[:100]} (type: {type(job_description_text)})")
+        print(f"  email: {email} (type: {type(email)})")
+        print(f"  questionnaire: {repr(questionnaire)[:100]} (type: {type(questionnaire)})")
+        if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
+            try:
+                ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
+                print(f"[DEBUG] Full ranking_result: {repr(ranking_result)}")
+                if isinstance(ranking_result, dict):
+                    ranking_score = ranking_result.get('score')
+                    explanation = ranking_result.get('explanation')
+                elif isinstance(ranking_result, (int, float)):
+                    ranking_score = ranking_result
+                    explanation = None
+                elif isinstance(ranking_result, str):
+                    import re
+                    match = re.search(r"([0-9]+\.?[0-9]*)", ranking_result)
+                    if match:
+                        ranking_score = float(match.group(1))
+                    explanation = None
+                if ranking_score is None or explanation is None or not str(explanation).strip():
+                    print(f"[ERROR] Ranking or explanation missing. ranking_score: {ranking_score}, explanation: {explanation}, ranking_result: {repr(ranking_result)}")
+                    raise HTTPException(status_code=500, detail=f"Ranking or explanation missing from ranking engine. Both are required. Debug: ranking_result={repr(ranking_result)}")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Ranking failed: {e}")
+        else:
+            raise HTTPException(status_code=500, detail="Insufficient data to perform ranking.")
+        application_data = {
+            "id": f"{job_id}_{email}",
+            "job_id": job_id,
+            "name": name,
+            "email": email,
+            "cover_letter": cover_letter,
+            "ranking": ranking_score,
+            "explanation": explanation,
+            "status": "applied",
+            "applied_at": datetime.utcnow().isoformat(),
+            "resume_blob_name": resume_blob_name,
+            "parsed_resume": parsed_resume,
+            "type": "candidate",
+        }
+        from common.database.cosmos.db_operations import upsert_candidate
+        upsert_candidate(application_data)
+        # Synchronous ranking: do not use background task
+        # rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume)  # No longer needed; ranking is immediate
+        return {"message": "Application submitted successfully. Ranking is available immediately.", "ranking": ranking_score}
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] Exception in apply_for_job: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def rank_candidate_resume_task(job_id, email, resume_blob_name, parsed_resume):
+    try:
+        from services.resume_ranking.resume_ranker.multiagent_resume_ranker import initiate_chat
+        job_description = db_operations.fetch_job_description(job_id)
+        job_questionnaire_doc = db_operations.fetch_job_description_questionnaire(job_id)
+        job_questionnaire_id = job_questionnaire_doc['id'] if job_questionnaire_doc else None
+        questionnaire = job_questionnaire_doc['questionnaire'] if job_questionnaire_doc else None
+        resume_text = ''
+        if parsed_resume and isinstance(parsed_resume, dict) and 'raw_text' in parsed_resume:
+            resume_text = parsed_resume['raw_text']
+        else:
+            try:
+                AZURE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+                CONTAINER_NAME = "resumes"
+                blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+                container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+                blob_client = container_client.get_blob_client(resume_blob_name)
+                stream = blob_client.download_blob().readall()
+                suffix = os.path.splitext(resume_blob_name)[-1].lower()
+                fd, temp_path = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+                with open(temp_path, "wb") as out_file:
+                    out_file.write(stream)
+                if suffix == '.pdf':
+                    text, hyperlinks = parse_pdf(temp_path)
+                elif suffix in ['.doc', '.docx']:
+                    text, hyperlinks = parse_doc(temp_path)
+                else:
+                    text, hyperlinks = '', []
+                resume_text = text
+                os.remove(temp_path)
+            except Exception as e:
+                resume_text = ''
+        job_description_text = job_description['description'] if job_description and 'description' in job_description else ''
+        if all([job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire]):
+            try:
+                ranking_result = initiate_chat(job_id, job_questionnaire_id, resume_text, job_description_text, email, questionnaire)
+                ranking_score = None
+                if isinstance(ranking_result, dict) and 'score' in ranking_result:
+                    ranking_score = float(ranking_result['score'])
+                elif isinstance(ranking_result, (float, int)):
+                    ranking_score = float(ranking_result)
+                else:
+                    import re
+                    match = re.search(r"([0-9]+\.?[0-9]*)", str(ranking_result))
+                    if match:
+                        ranking_score = float(match.group(1))
+                if ranking_score is not None:
+                    candidate = db_operations.fetch_resume_with_email_and_job(job_id, email)
+                    if candidate:
+                        candidate['ranking'] = ranking_score
+                        db_operations.upsert_candidate(candidate)
+            except Exception as e:
+                pass
+        else:
+            pass
+    except Exception as e:
+        pass
+
+# --- Debug/Admin Endpoint ---
+@app.get("/debug/candidates/{job_id}")
+async def get_candidates_for_job(job_id: str):
+    candidates = db_operations.fetch_top_k_candidates_by_count(job_id)
+    return {"count": len(candidates), "candidates": candidates}
+
+# --- AI Job Description Endpoint ---
+class JobDescriptionRequest(BaseModel):
+    title: str = None
+    company_name: str = None
+    location: str = None
+    type: str = None
+    time_commitment: str = None
+    description: str = None
+    requirements: str = None
+    job_id: str = None
+
+@app.post("/api/generate-job-description")
+def generate_job_description(request: JobDescriptionRequest):
+    from services.ai_job_description.generate_description import generate_description
+    import json
+    import re
+    try:
+        data = request.dict()
+        generated = generate_description(data)
+        cleaned = generated.strip()
+        if cleaned.lower().startswith('json'):
+            cleaned = cleaned.split('\n', 1)[-1]
+        cleaned = cleaned.strip('`')
+        try:
+            result = json.loads(cleaned)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+        match = re.search(r'({[\s\S]*})', cleaned)
+        if match:
+            try:
+                result = json.loads(match.group(1))
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail="AI did not return valid JSON. Please try again or check the prompt.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Email Sending Endpoint ---
+from pydantic import BaseModel
+from fastapi import APIRouter
+
+class SendEmailRequest(BaseModel):
+    to: list[str]
+    subject: str
+    body: str
+
+@app.post("/api/send-email")
+async def api_send_email(request: SendEmailRequest):
+    try:
+        # Call the backend email sender
+        result = send_email(request.to, request.subject, request.body)
+        if result.get("status") == "success":
+            return {"success": True, "details": result.get("details")}
+        else:
+            return {"success": False, "error": result.get("details")}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+from fastapi import WebSocket, WebSocketDisconnect
+import threading
+import queue
+import time
+import asyncio
+
+# In-memory chat session store for WebSocket chat
+chat_sessions = {}
+
+# Function to clean up inactive chat sessions after a timeout
+async def cleanup_session_after_timeout(session_id, timeout_seconds):
+    """Clean up a chat session after a specified timeout if it's still inactive"""
+    await asyncio.sleep(timeout_seconds)
+    
+    if session_id in chat_sessions:
+        # Check if the session is still inactive
+        last_active = chat_sessions[session_id].get("last_active", 0)
+        time_since_active = time.time() - last_active
+        
+        if time_since_active >= timeout_seconds:
+            try:
+                # Put the message in the queue for the agent thread to process
+                if session_id in chat_sessions and "input_queue" in chat_sessions[session_id]:
+                    chat_sessions[session_id]["input_queue"].put(data)
+                    logging.info(f"[WebSocket] Added message to queue for processing")
+                    
+                    # Send an acknowledgment to the client that the message was received
+                    try:
+                        ack_message = json.dumps({"type": "ack", "timestamp": time.time(), "message": "Message received and being processed"})
+                        await websocket.send_text(ack_message)
+                        logging.info(f"[WebSocket] Sent acknowledgment to client")
+                    except Exception as ack_error:
+                        logging.error(f"[WebSocket] Error sending acknowledgment: {str(ack_error)}")
+                else:
+                    logging.error(f"[WebSocket] No input queue found for session {session_id}")
+                
+                # Remove the session
+                del chat_sessions[session_id]
+                logging.info(f"[WebSocket] Cleaned up inactive session: session_id={session_id}, inactive for {time_since_active:.2f} seconds")
+            except Exception as cleanup_error:
+                logging.error(f"[WebSocket] Error cleaning up session {session_id}: {str(cleanup_error)}")
+        else:
+            logging.info(f"[WebSocket] Session {session_id} still active, skipping cleanup")
+    else:
+        logging.info(f"[WebSocket] Session {session_id} no longer exists, no cleanup needed")
+
+@app.websocket("/ws/chat/{session_id}")
+async def websocket_chat(websocket: WebSocket, session_id: str):
+    # Extract candidate ID from query parameters if present
+    candidate_id = None
+    try:
+        # Get query parameters
+        query_params = websocket.query_params
+        if query_params and "candidateId" in query_params:
+            candidate_id = query_params.get("candidateId")
+            logging.info(f"[WebSocket] Extracted candidateId from query params: {candidate_id}")
+    except Exception as query_err:
+        logging.error(f"[WebSocket] Error extracting query parameters: {str(query_err)}")
+    logging.info(f"[WebSocket] New connection attempt: session_id={session_id}")
+    
+    # Log request headers for debugging
+    try:
+        headers = websocket.headers
+        logging.info(f"[WebSocket] Connection headers: {headers}")
+    except Exception as header_err:
+        logging.error(f"[WebSocket] Error accessing headers: {str(header_err)}")
+    
+    # Create input queue if it doesn't exist yet
+    if session_id not in chat_sessions:
+        logging.info(f"[WebSocket] Creating new session: session_id={session_id}")
+        chat_sessions[session_id] = {
+            "input_queue": queue.Queue(),
+            "history": [],
+            "initialized": False,
+            "last_active": time.time(),
+            "connection_state": "CONNECTED",
+            "websocket": websocket,
+            "pending_messages": [],  # Initialize pending messages list
+            "candidate_id": candidate_id  # Store candidate ID in session
+        }
+        logging.info(f"[WebSocket] Stored candidateId in session: {candidate_id}")
+    elif candidate_id and ("candidate_id" not in chat_sessions[session_id] or chat_sessions[session_id]["candidate_id"] != candidate_id):
+        # Update candidate ID if it's changed
+        chat_sessions[session_id]["candidate_id"] = candidate_id
+        logging.info(f"[WebSocket] Updated candidateId in session: {candidate_id}")
+    
+    # Get or create input queue for this session
+    if "input_queue" not in chat_sessions[session_id]:
+        chat_sessions[session_id]["input_queue"] = queue.Queue()
+    
+    input_queue = chat_sessions[session_id]["input_queue"]
+    
+    try:
+        # Accept the WebSocket connection with explicit CORS handling
+        await websocket.accept()
+        logging.info(f"[WebSocket] Connection accepted: session_id={session_id}")
+        
+        # Log connection details
+        client = websocket.client
+        logging.info(f"[WebSocket] Client connected: {client}")
+        
+        # Send initial connection confirmation
+        try:
+            import json  # Import json explicitly in this scope
+            confirmation_message = json.dumps({"type": "text", "content": "Connected to chat server successfully."})
+            await websocket.send_text(confirmation_message)
+            logging.info(f"[WebSocket] Sent connection confirmation message to client: {confirmation_message}")
+            
+            # Send a ping to verify connection is working
+            ping_message = json.dumps({"type": "ping", "timestamp": time.time()})
+            await websocket.send_text(ping_message)
+            logging.info(f"[WebSocket] Sent ping message to verify connection")
+            
+            # Check if there are any pending messages to send from previous connection
+            if session_id in chat_sessions and "pending_messages" in chat_sessions[session_id] and chat_sessions[session_id]["pending_messages"]:
+                pending_messages = chat_sessions[session_id]["pending_messages"]
+                logging.info(f"[WebSocket] Found {len(pending_messages)} pending messages to deliver")
+                
+                for pending_msg in pending_messages:
+                    try:
+                        await websocket.send_text(pending_msg)
+                        logging.info(f"[WebSocket] Delivered pending message: {pending_msg[:50]}...")
+                    except Exception as pending_error:
+                        logging.error(f"[WebSocket] Error sending pending message: {str(pending_error)}")
+                
+                # Clear pending messages after sending
+                chat_sessions[session_id]["pending_messages"] = []
+        except Exception as confirm_error:
+            logging.error(f"[WebSocket] Error sending confirmation message: {str(confirm_error)}")
+            # Try a plain text message as fallback
+            try:
+                await websocket.send_text('{"type": "text", "content": "Connected to chat server."}') 
+                logging.info(f"[WebSocket] Sent fallback plain text connection confirmation")
+            except Exception as fallback_error:
+                logging.error(f"[WebSocket] Error sending fallback confirmation: {str(fallback_error)}")
+        
+        # Update last active time for the session
+        chat_sessions[session_id]["last_active"] = time.time()
+    
+        def agent_thread():
+            # Import necessary modules at the beginning of the function to ensure they're in scope
+            import json
+            import asyncio
+            import traceback
+            import time
+            from services.chatbot.multiagent_assistant import chat_step, start_new_chat
+            
+            # Get candidate ID from session if available
+            session_candidate_id = chat_sessions[session_id].get("candidate_id") if session_id in chat_sessions else None
+            logging.info(f"[WebSocket] Agent thread using candidate_id from session: {session_candidate_id}")
+            
+            # Start a new chat session if not already started
+            if session_id in chat_sessions and "initialized" not in chat_sessions[session_id]:
+                logging.info(f"[WebSocket] Initializing new agent session for session_id={session_id}")
+                # Pass session_id to start_new_chat if supported, else map manually
+                try:
+                    from services.chatbot.multiagent_assistant import start_new_chat
+                    start_new_chat(session_id)
+                    logging.info(f"[WebSocket] Successfully initialized chat session for {session_id}")
+                except TypeError:
+                    # fallback to legacy signature
+                    try:
+                        start_new_chat()
+                        logging.info(f"[WebSocket] Successfully initialized chat session with legacy signature")
+                    except Exception as init_error:
+                        logging.error(f"[WebSocket] Error initializing chat session: {str(init_error)}")
+                except ImportError as import_err:
+                    logging.error(f"[WebSocket] Failed to import start_new_chat: {str(import_err)}")
+                except Exception as e:
+                    logging.error(f"[WebSocket] Error in start_new_chat: {str(e)}")
+                    logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                
+                chat_sessions[session_id]["initialized"] = True
+                
+            # Import necessary modules at the beginning of the function to avoid scope issues
+            import json
+            import asyncio
+            import traceback
+            import time
+            
+            while True:
+                try:
+                    # Get a message from the queue
+                    message = input_queue.get(block=True)
+                    
+                    # Check if message is None
+                    if message is None:
+                        logging.warning("[WebSocket] Received None message from queue, skipping")
+                        continue
+                        
+                    logging.info(f"[WebSocket] Agent thread processing message from queue: {message[:100] if isinstance(message, str) else str(message)[:100]}...")
+                    
+                    # Process the message
+                    user_message = message
+                    message_text = user_message
+                    
+                    # Use candidate ID from session by default
+                    candidate_id = session_candidate_id
+                    
+                    try:
+                        # Skip processing for ping/pong messages
+                        if isinstance(user_message, str) and ('"type":"ping"' in user_message or '"type":"pong"' in user_message):
+                            logging.debug(f"[WebSocket] Skipping ping/pong message in agent thread")
+                            continue
+                            
+                        # Check if the message is JSON with context
+                        message_data = json.loads(user_message)
+                        logging.info(f"[WebSocket] Parsed message data: {message_data}")
+                        
+                        # Handle different message formats
+                        if isinstance(message_data, dict):
+                            # Skip processing for ping/pong messages in JSON format
+                            if 'type' in message_data and message_data['type'] in ['ping', 'pong']:
+                                logging.debug(f"[WebSocket] Skipping ping/pong message in agent thread")
+                                continue
+                            
+                            # Handle test messages
+                            if 'test' in message_data and message_data['test'] is True:
+                                logging.info(f"[WebSocket] Received test message: {message_data}")
+                                
+                                # Handle echo test
+                                if 'text' in message_data and message_data['text'] == "__TEST_ECHO__":
+                                    echo_reply = {
+                                        "type": "text",
+                                        "content": "Echo test successful",
+                                        "echo_response": True,
+                                        "timestamp": time.time(),
+                                        "original_message": message_data
+                                    }
+                                    
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        loop.run_until_complete(websocket.send_text(json.dumps(echo_reply)))
+                                        logging.info(f"[WebSocket] Sent echo reply: {echo_reply}")
+                                    except Exception as e:
+                                        logging.error(f"[WebSocket] Error sending echo reply: {str(e)}")
+                                        logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                                    finally:
+                                        loop.close()
+                                    continue
+                                
+                                # Handle direct test
+                                if 'text' in message_data and message_data['text'] == "__DIRECT_TEST__":
+                                    direct_reply = {
+                                        "type": "text",
+                                        "content": "Direct test successful - message received and processed",
+                                        "test_response": True,
+                                        "timestamp": time.time()
+                                    }
+                                    
+                                    loop = asyncio.new_event_loop()
+                                    asyncio.set_event_loop(loop)
+                                    try:
+                                        loop.run_until_complete(websocket.send_text(json.dumps(direct_reply)))
+                                        logging.info(f"[WebSocket] Sent direct test reply: {direct_reply}")
+                                    except Exception as e:
+                                        logging.error(f"[WebSocket] Error sending direct test reply: {str(e)}")
+                                        logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                                    finally:
+                                        loop.close()
+                                    continue
+                                
+                            # Format 1: {text: "message", context: {candidateId: "id"}}
+                            if 'text' in message_data:
+                                message_text = message_data['text']
+                                if 'context' in message_data and 'candidateId' in message_data['context']:
+                                    candidate_id = message_data['context']['candidateId']
+                            
+                        context = message_data.get('context', {})
+                        candidate_id = context.get('candidateId') if context else None
+                        
+                        logging.info(f"[WebSocket] Processing message in agent thread: '{message_text[:50]}...' with candidate_id={candidate_id}")
+                        
+                        # Process the message with the AI assistant
+                        try:
+                            from services.chatbot.multiagent_assistant import chat_step
+                                            json_reply = json.loads(reply)
+                                            logging.info(f"[WebSocket] Reply is valid JSON with keys: {list(json_reply.keys())}")
+                                            if 'candidateInfo' in json_reply:
+                                                logging.info(f"[WebSocket] Reply contains candidateInfo with id: {json_reply['candidateInfo'].get('id')}")
+                                        else:
+                                            logging.warning(f"[WebSocket] Reply is not a string but a {type(reply)}")
+                                    except json.JSONDecodeError:
+                                        logging.warning(f"[WebSocket] Reply is not valid JSON: {reply[:100]}...")
+                                    except Exception as debug_err:
+                                        logging.error(f"[WebSocket] Error in debug logging: {str(debug_err)}")
+                            except Exception as chat_step_err:
+                                logging.error(f"[WebSocket] Error in chat_step: {str(chat_step_err)}")
+                                logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                                reply = None
+                            
+                            # Make sure the reply is not None
+                            if not reply:
+                                logging.warning(f"[WebSocket] Empty reply from chat_step, creating fallback response")
+                                
+                                # Create a fallback response with candidate info if available
+                                fallback_response = {
+                                    "type": "text", 
+                                    "content": f"I received your message: '{message_text}'. However, I couldn't process it at this time.",
+                                    "isProcessing": False
+                                }
+                                
+                                # Add candidate info to the fallback response if we have a candidate_id
+                                if candidate_id:
+                                    try:
+                                        # Try different import paths for db_operations
+                                        db_operations_imported = False
+                                        try:
+                                            from common.database.cosmos import db_operations
+                                            db_operations_imported = True
+                                        except ImportError:
+                                            try:
+                                                from neunet_ai_services.common.database.cosmos import db_operations
+                                                db_operations_imported = True
+                                            except ImportError:
+                                                logging.error("[WebSocket] Could not import db_operations, using mock candidate data")
+                                        
+                                        candidate_data = None
+                                        if db_operations_imported:
+                                            candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                        else:
+                                            # Use mock data if db_operations can't be imported
+                                            candidate_data = {
+                                                "id": candidate_id,
+                                                "name": "Test Candidate",
+                                                "email": "test@example.com",
+                                                "resume": {
+                                                    "contact": {
+                                                        "linkedin": "https://linkedin.com/in/testcandidate",
+                                                        "github": "https://github.com/testcandidate"
+                                                    }
+                                                },
+                                                "jobs_applied": ["job-123"]
+                                            }
+                                        
+                                        if candidate_data:
+                                            # Add candidate info to the response
+                                            fallback_response["candidateInfo"] = candidate_data
+                                            logging.info(f"[WebSocket] Added candidate info to fallback response: {candidate_data}")
+                                    except Exception as candidate_err:
+                                        logging.error(f"[WebSocket] Error adding candidate info to fallback response: {str(candidate_err)}")
+                                
+                                reply = json.dumps(fallback_response)
+                            
+                            # Log the full reply for debugging
+                            logging.info(f"[WebSocket] Full reply from chat_step: {reply}")
+                            
+                            # Ensure we have a valid JSON response with candidate info
+                            try:
+                                # Parse the reply as JSON
+                                reply_json = json.loads(reply)
+                                
+                                # Always ensure we have a valid response structure
+                                if not isinstance(reply_json, dict):
+                                    reply_json = {"type": "text", "content": str(reply_json), "isProcessing": False}
+                                    logging.warning(f"[WebSocket] Reply was not a dictionary, converted to: {reply_json}")
+                                
+                                # If reply doesn't have candidate info but we have candidate_id, add it
+                                if candidate_id and ("candidateInfo" not in reply_json or not reply_json.get("candidateInfo")):
+                                    logging.info(f"[WebSocket] Adding missing candidate info to reply for candidate_id: {candidate_id}")
+                                    
+                                    # Try all possible import paths for db_operations
+                                    candidate_data = None
+                                    db_operations = None
+                                    
+                                    # Try different import paths for db_operations
+                                    db_operations_imported = False
+                                    for import_path in [
+                                        "from common.database.cosmos import db_operations",
+                                        "from neunet_ai_services.common.database.cosmos import db_operations",
+                                        "from services.database import db_operations"
+                                    ]:
+                                        try:
+                                            exec(import_path)
+                                            logging.info(f"[WebSocket] Successfully imported db_operations via: {import_path}")
+                                            db_operations_imported = True
+                                            break
+                                        except ImportError:
+                                            continue
+                                    
+                                    # Try to fetch candidate data
+                                    try:
+                                        if 'db_operations' in locals() and db_operations:
+                                            candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                            logging.info(f"[WebSocket] Fetched candidate data from database: {candidate_id}")
+                                        else:
+                                            logging.warning(f"[WebSocket] Could not import db_operations, using mock candidate data")
+                                    except Exception as db_err:
+                                        logging.error(f"[WebSocket] Error fetching candidate data: {str(db_err)}")
+                                    
+                                    # If we couldn't get real data, use mock data
+                                    if not candidate_data:
+                                        logging.info(f"[WebSocket] Using mock candidate data for {candidate_id}")
+                                        candidate_data = {
+                                            "id": candidate_id,
+                                            "name": "Test Candidate",
+                                            "email": "test@example.com",
+                                            "resume": {
+                                                "contact": {
+                                                    "linkedin": "https://linkedin.com/in/testcandidate",
+                                                    "github": "https://github.com/testcandidate"
+                                                }
+                                            },
+                                            "jobs_applied": ["job-123"]
+                                        }
+                                    
+                                    # Ensure we have the minimum required candidate info structure
+                                    if candidate_data and isinstance(candidate_data, dict):
+                                        # Make sure resume and contact fields exist
+                                        if "resume" not in candidate_data or not candidate_data["resume"]:
+                                            candidate_data["resume"] = {}
+                                        if not isinstance(candidate_data["resume"], dict):
+                                            candidate_data["resume"] = {}
+                                        if "contact" not in candidate_data["resume"] or not candidate_data["resume"]["contact"]:
+                                            candidate_data["resume"]["contact"] = {}
+                                        if not isinstance(candidate_data["resume"]["contact"], dict):
+                                            candidate_data["resume"]["contact"] = {}
+                                            
+                                        # Ensure LinkedIn and GitHub fields exist
+                                        if "linkedin" not in candidate_data["resume"]["contact"]:
+                                            candidate_data["resume"]["contact"]["linkedin"] = ""
+                                        if "github" not in candidate_data["resume"]["contact"]:
+                                            candidate_data["resume"]["contact"]["github"] = ""
+                                        
+                                        # Add candidate info to the response
+                                        reply_json["candidateInfo"] = candidate_data
+                                        logging.info(f"[WebSocket] Added candidate info to reply with LinkedIn: {bool(candidate_data['resume']['contact']['linkedin'])}, GitHub: {bool(candidate_data['resume']['contact']['github'])}")
+                                    else:
+                                        logging.error(f"[WebSocket] Invalid candidate data structure: {candidate_data}")
+                                
+                                # Update the reply with the modified JSON
+                                reply = json.dumps(reply_json)
+                            except json.JSONDecodeError as json_err:
+                                logging.error(f"[WebSocket] Invalid JSON in reply: {str(json_err)}")
+                                # Create a valid JSON response with the text content
+                                fallback_response = {
+                                    "type": "text", 
+                                    "content": reply,
+                                    "isProcessing": False
+                                }
+                                
+                                # Add candidate info if available
+                                if candidate_id:
+                                    try:
+                                        # Add mock candidate data
+                                        fallback_response["candidateInfo"] = {
+                                            "id": candidate_id,
+                                            "name": "Test Candidate",
+                                            "email": "test@example.com",
+                                            "resume": {
+                                                "contact": {
+                                                    "linkedin": "https://linkedin.com/in/testcandidate",
+                                                    "github": "https://github.com/testcandidate"
+                                                }
+                                            },
+                                            "jobs_applied": ["job-123"]
+                                        }
+                                        logging.info(f"[WebSocket] Added mock candidate info to fallback JSON response")
+                                    except Exception as mock_err:
+                                        logging.error(f"[WebSocket] Error adding mock candidate info: {str(mock_err)}")
+                                
+                                reply = json.dumps(fallback_response)
+                            except Exception as candidate_err:
+                                logging.error(f"[WebSocket] Error processing reply: {str(candidate_err)}")
+                                logging.error(traceback.format_exc())
+                            
+                            # Use the final reply as our formatted reply
+                            formatted_reply = reply
+                            
+                            # Log candidate info if present
+                            try:
+                                reply_check = json.loads(formatted_reply)
+                                if "candidateInfo" in reply_check:
+                                    logging.info(f"[WebSocket] Reply contains candidate info")
+                                    if "resume" in reply_check["candidateInfo"] and "contact" in reply_check["candidateInfo"]["resume"]:
+                                        linkedin = reply_check["candidateInfo"]["resume"]["contact"].get("linkedin")
+                                        github = reply_check["candidateInfo"]["resume"]["contact"].get("github")
+                                        logging.info(f"[WebSocket] LinkedIn: {linkedin}, GitHub: {github}")
+                            except json.JSONDecodeError:
+                                logging.warning(f"[WebSocket] Could not parse reply as JSON to check for candidate info")
+                            except Exception as parse_err:
+                                logging.warning(f"[WebSocket] Error checking for candidate info: {str(parse_err)}")
+                        except ImportError as import_err:
+                            logging.error(f"[WebSocket] Failed to import chat_step: {str(import_err)}")
+                            reply = json.dumps({"type": "text", "content": "Sorry, the AI processing module could not be loaded. Please contact support.", "isProcessing": False})
+                        except Exception as chat_err:
+                            logging.error(f"[WebSocket] Error in chat_step: {str(chat_err)}")
+                            logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                            reply = json.dumps({"type": "text", "content": "Sorry, there was an error processing your message. The AI system is being updated.", "isProcessing": False})
+                            
+                        # If reply is None or empty, provide a fallback response
+                        if not reply:
+                            logging.warning(f"[WebSocket] Empty reply from chat_step, using fallback")
+                            
+                            # Create a fallback response that includes candidate info if available
+                            fallback_response = {
+                                "type": "text", 
+                                "content": f"I received your message: '{message_text}'. The AI processing queue is currently being fixed.",
+                                "isProcessing": False
+                            }
+                            
+                            # Include candidate info in the fallback response if we have a candidate_id
+                            if candidate_id:
+                                logging.info(f"[WebSocket] Adding candidate info to fallback response for candidate_id: {candidate_id}")
+                                # Import the database operations module to fetch candidate info
+                                try:
+                                    # Try different import paths for db_operations
+                                    db_operations_imported = False
+                                    try:
+                                        from common.database.cosmos import db_operations
+                                        db_operations_imported = True
+                                    except ImportError:
+                                        try:
+                                            from neunet_ai_services.common.database.cosmos import db_operations
+                                            db_operations_imported = True
+                                        except ImportError:
+                                            logging.error("[WebSocket] Could not import db_operations, using mock candidate data")
+                                    
+                                    if db_operations_imported:
+                                        candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                    else:
+                                        # Use mock data if db_operations can't be imported
+                                        candidate_data = {
+                                            "id": candidate_id,
+                                            "name": "Test Candidate",
+                                            "email": "test@example.com",
+                                            "resume": {
+                                                "contact": {
+                                                    "linkedin": "https://linkedin.com/in/testcandidate",
+                                                    "github": "https://github.com/testcandidate"
+                                                }
+                                            },
+                                            "jobs_applied": ["job-123"]
+                                        }
+                                    
+                                    if candidate_data:
+                                        # Extract LinkedIn and GitHub links using our utility function
+                                        from services.utils.resume_parser import extract_linkedin_github_from_resume
+                                        
+                                        linkedin = ""
+                                        github = ""
+                                        
+                                        # Try to get resume data
+                                        if "resume_data" in candidate_data and candidate_data["resume_data"]:
+                                            resume_data = candidate_data["resume_data"]
+                                            linkedin, github = extract_linkedin_github_from_resume(resume_data)
+                                            logging.info(f"[WebSocket] Extracted LinkedIn: {bool(linkedin)}, GitHub: {bool(github)} from resume data")
+                                        
+                                        # Add candidate info to the response
+                                        fallback_response["candidateInfo"] = {
+                                            "id": candidate_id,
+                                            "name": candidate_data.get("name", ""),
+                                            "email": candidate_data.get("email", ""),
+                                            "resume": {
+                                                "contact": {
+                                                    "linkedin": linkedin,
+                                                    "github": github
+                                                }
+                                            }
+                                        }
+                                        logging.info(f"[WebSocket] Added candidate info to fallback response. LinkedIn: {bool(linkedin)}, GitHub: {bool(github)}")
+                                except Exception as e:
+                                    logging.error(f"[WebSocket] Error adding candidate info to fallback response: {str(e)}")
+                            
+                            reply = json.dumps(fallback_response)
+                        
+                        # Send the reply back to the client
+                        # Send the reply back to the client
+                        # Create a new event loop for this thread if needed
+                        try:
+                            loop = asyncio.get_event_loop()
+                        except RuntimeError:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                        
+                        # Format the reply as JSON if it's not already
+                        try:
+                            # Check if reply is already valid JSON
+                            reply_obj = json.loads(reply)
+                            
+                            # Ensure isProcessing is set to False for final response
+                            if isinstance(reply_obj, dict):
+                                reply_obj["isProcessing"] = False
+                                
+                                # Make sure candidateInfo is included if we have candidate_id
+                                if candidate_id and "candidateInfo" not in reply_obj:
+                                    logging.warning(f"[WebSocket] Final reply missing candidateInfo, adding it now")
+                                    try:
+                                        # Try to get candidate data
+                                        from common.database.cosmos import db_operations
+                                        candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                        
+                                        if candidate_data:
+                                            # Ensure resume structure exists
+                                            if "resume" not in candidate_data:
+                                                candidate_data["resume"] = {}
+                                            if not isinstance(candidate_data["resume"], dict):
+                                                candidate_data["resume"] = {}
+                                            if "contact" not in candidate_data["resume"]:
+                                                candidate_data["resume"]["contact"] = {}
+                                            if not isinstance(candidate_data["resume"]["contact"], dict):
+                                                candidate_data["resume"]["contact"] = {}
+                                            
+                                            # Ensure LinkedIn and GitHub fields exist
+                                            if "linkedin" not in candidate_data["resume"]["contact"]:
+                                                candidate_data["resume"]["contact"]["linkedin"] = ""
+                                            if "github" not in candidate_data["resume"]["contact"]:
+                                                candidate_data["resume"]["contact"]["github"] = ""
+                                            
+                                            reply_obj["candidateInfo"] = candidate_data
+                                            logging.info(f"[WebSocket] Added candidate info with LinkedIn: {bool(candidate_data['resume']['contact']['linkedin'])}, GitHub: {bool(candidate_data['resume']['contact']['github'])}")
+                                    except Exception as candidate_err:
+                                        logging.error(f"[WebSocket] Error adding candidate info: {str(candidate_err)}")
+                                        # Add mock candidate data as fallback
+                                        reply_obj["candidateInfo"] = {
+                                            "id": candidate_id,
+                                            "name": "Candidate",
+                                            "email": "candidate@example.com",
+                                            "resume": {
+                                                "contact": {
+                                                    "linkedin": "https://linkedin.com/in/candidate",
+                                                    "github": "https://github.com/candidate"
+                                                }
+                                            },
+                                            "jobs_applied": []
+                                        }
+                                
+                            formatted_reply = json.dumps(reply_obj)
+                            logging.info(f"[WebSocket] Reply is valid JSON with isProcessing=False")
+                        except json.JSONDecodeError:
+                            # If not JSON, wrap it in a text message format with candidate info
+                            reply_obj = {"type": "text", "content": reply, "isProcessing": False}
+                            
+                            # Add candidate info if we have candidate_id
+                            if candidate_id:
+                                try:
+                                    # Try to get candidate data
+                                    from common.database.cosmos import db_operations
+                                    candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                    if candidate_data:
+                                        reply_obj["candidateInfo"] = candidate_data
+                                except Exception:
+                                    # Add mock candidate data as fallback
+                                    reply_obj["candidateInfo"] = {
+                                        "id": candidate_id,
+                                        "name": "Candidate",
+                                        "email": "candidate@example.com",
+                                        "resume": {
+                                            "contact": {
+                                                "linkedin": "https://linkedin.com/in/candidate",
+                                                "github": "https://github.com/candidate"
+                                            }
+                                        },
+                                        "jobs_applied": []
+                                    }
+                            
+                            formatted_reply = json.dumps(reply_obj)
+                            logging.info(f"[WebSocket] Wrapped plain text reply in JSON format with candidate info")
+                        
+                        # Log the formatted reply for debugging
+                        logging.info(f"[WebSocket] Formatted reply to send: {formatted_reply[:200]}...")
+                        
+                        # Check if WebSocket is still open before sending
+                        try:
+                            # Check if the connection is still open using the proper WebSocketState enum
+                            from starlette.websockets import WebSocketState
+                            
+                            # Store connection state in session for reference
+                            if session_id in chat_sessions:
+                                chat_sessions[session_id]["connection_state"] = getattr(websocket, "client_state", "UNKNOWN")
+                                logging.info(f"[WebSocket] Current connection state: {getattr(websocket, 'client_state', 'UNKNOWN')}")
+                            
+                            # Force send the message regardless of connection state
+                            # This is a temporary fix to ensure messages are delivered
+                            try:
+                                # Create a simple async function to send the message
+                                async def send_message(ws, message):
+                                    try:
+                                        await ws.send_text(message)
+                                        logging.info(f"[WebSocket] Message sent successfully")
+                                        return True
+                                    except Exception as send_err:
+                                        logging.error(f"[WebSocket] Error in send_message: {str(send_err)}")
+                                        return False
+                            
+                                # Try to use the stored websocket if available
+                                if session_id in chat_sessions and "websocket" in chat_sessions[session_id]:
+                                    stored_websocket = chat_sessions[session_id]["websocket"]
+                                    try:
+                                        success = loop.run_until_complete(send_message(stored_websocket, formatted_reply))
+                                        if success:
+                                            logging.info(f"[WebSocket] Successfully sent reply using stored websocket")
+                                        else:
+                                    
+                                    # Try to use the stored websocket if available
+                                    if session_id in chat_sessions and "websocket" in chat_sessions[session_id]:
+                                        stored_websocket = chat_sessions[session_id]["websocket"]
+                                        try:
+                                            success = loop.run_until_complete(send_message(stored_websocket, formatted_reply))
+                                            if success:
+                                                logging.info(f"[WebSocket] Successfully sent reply using stored websocket")
+                                            else:
+                                                # Fall back to original websocket
+                                                success = loop.run_until_complete(send_message(websocket, formatted_reply))
+                                                logging.info(f"[WebSocket] Sent reply using original websocket: {success}")
+                                        except Exception as stored_ws_error:
+                                            logging.error(f"[WebSocket] Error using stored websocket: {str(stored_ws_error)}")
+                                            # Fall back to original websocket
+                                            try:
+                                                success = loop.run_until_complete(send_message(websocket, formatted_reply))
+                                                logging.info(f"[WebSocket] Sent reply using original websocket after stored error: {success}")
+                                            except Exception as orig_ws_error:
+                                                logging.error(f"[WebSocket] Error using original websocket: {str(orig_ws_error)}")
+                                    else:
+                                        # Use original websocket if no stored one is available
+                                        success = loop.run_until_complete(send_message(websocket, formatted_reply))
+                                        logging.info(f"[WebSocket] Sent reply using original websocket (no stored): {success}")
+                                    
+                                    logging.info(f"[WebSocket] Successfully sent JSON reply to frontend")
+                                except Exception as force_send_error:
+                                    logging.error(f"[WebSocket] Error in force send: {str(force_send_error)}")
+                                    
+                                    # Store the message for later delivery if client reconnects
+                                    if session_id in chat_sessions:
+                                        if "pending_messages" not in chat_sessions[session_id]:
+                                            chat_sessions[session_id]["pending_messages"] = []
+                                        chat_sessions[session_id]["pending_messages"].append(formatted_reply)
+                                        logging.info(f"[WebSocket] Stored message for later delivery: {formatted_reply[:50]}...")
+                            except Exception as ws_state_error:
+                                logging.error(f"[WebSocket] Error checking WebSocket state: {str(ws_state_error)}")
+                                # Try to send anyway
+                                try:
+                                    loop.run_until_complete(websocket.send_text(formatted_reply))
+                                    logging.info(f"[WebSocket] Successfully sent JSON reply to frontend despite state check error")
+                                except Exception as fallback_send_error:
+                                    logging.error(f"[WebSocket] Fallback send also failed: {str(fallback_send_error)}")
+                                    # Store the message for later delivery
+                                    if session_id in chat_sessions:
+                                        if "pending_messages" not in chat_sessions[session_id]:
+                                            chat_sessions[session_id]["pending_messages"] = []
+                                        chat_sessions[session_id]["pending_messages"].append(formatted_reply)
+                                        logging.info(f"[WebSocket] Stored message for later delivery: {formatted_reply[:50]}...")
+                            except RuntimeError as ws_error:
+                                if "after sending 'websocket.close'" in str(ws_error) or "Cannot call 'send_text' on closed" in str(ws_error):
+                                    logging.warning(f"[WebSocket] Cannot send message - connection already closed: {str(ws_error)}")
+                                    # Store the message for later delivery if client reconnects
+                                    if session_id in chat_sessions:
+                                        if "pending_messages" not in chat_sessions[session_id]:
+                                            chat_sessions[session_id]["pending_messages"] = []
+                                        chat_sessions[session_id]["pending_messages"].append(formatted_reply)
+                                        logging.info(f"[WebSocket] Stored message for later delivery: {formatted_reply[:50]}...")
+                                else:
+                                    raise
+                        except Exception as send_error:
+                            logging.error(f"[WebSocket] Error sending reply to frontend: {str(send_error)}")
+                            logging.error(traceback.format_exc())
+                        finally:
+                            loop.close()
+                            
+                    except Exception as e:
+                        logging.error(f"[WebSocket] Error in agent thread: {str(e)}")
+                        logging.error(f"[WebSocket] Error traceback: {traceback.format_exc()}")
+                        
+                        # Send error message back to client with candidate info if available
+                        error_response = {
+                            "type": "text", 
+                            "content": f"Sorry, there was an error processing your message. Please try again later.",
+                            "isProcessing": False
+                        }
+                        
+                        # Include candidate info in the error response if we have a candidate_id
+                        if candidate_id:
+                            try:
+                                from services.database import db_operations
+                                candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                
+                                if candidate_data:
+                                    # Extract LinkedIn and GitHub links using our utility function
+                                    from services.utils.resume_parser import extract_linkedin_github_from_resume
+                                    
+                                    linkedin = ""
+                                    github = ""
+                                    
+                                    # Try to get resume data
+                                    if "resume_data" in candidate_data and candidate_data["resume_data"]:
+                                        resume_data = candidate_data["resume_data"]
+                                        linkedin, github = extract_linkedin_github_from_resume(resume_data)
+                                        logging.info(f"[WebSocket] Extracted LinkedIn: {bool(linkedin)}, GitHub: {bool(github)} from resume data")
+                                    
+                                    # Add candidate info to the response
+                                    error_response["candidateInfo"] = {
+                                        "id": candidate_id,
+                                        "name": candidate_data.get("name", ""),
+                                        "email": candidate_data.get("email", ""),
+                                        "resume": {
+                                            "contact": {
+                                                "linkedin": linkedin,
+                                                "github": github
+                                            }
+                                        }
+                                    }
+                                    logging.info(f"[WebSocket] Added candidate info to error response. LinkedIn: {bool(linkedin)}, GitHub: {bool(github)}")
+                            except Exception as add_info_error:
+                                logging.error(f"[WebSocket] Error adding candidate info to error response: {str(add_info_error)}")
+                        
+                        error_reply = json.dumps(error_response)
+                        
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        
+                        try:
+                            loop.run_until_complete(websocket.send_text(error_reply))
+                        except Exception as send_error:
+                            logging.error(f"[WebSocket] Error sending error reply to frontend: {str(send_error)}")
+                            logging.error(f"[WebSocket] Send error traceback: {traceback.format_exc()}")
+                        finally:
+                            loop.close()
+                except Exception as thread_error:
+                    logging.error(f"[WebSocket] Unexpected error in agent thread: {str(thread_error)}")
+                    logging.error(f"[WebSocket] Thread error traceback: {traceback.format_exc()}")
+                    # Try to continue processing messages
+                    # Add a small delay to avoid tight error loops
+                    time.sleep(1)
+                    
+                    # Try to send an error message to the client
+                    try:
+                        error_message = json.dumps({
+                            "type": "error",
+                            "content": f"An error occurred while processing your message: {str(thread_error)}",
+                            "isProcessing": False
+                        })
+                        
+                        # Create a new event loop for sending the error message
+                        error_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(error_loop)
+                        
+                        async def send_error(ws, msg):
+                            await ws.send_text(msg)
+                        
+                        try:
+                            error_loop.run_until_complete(send_error(websocket, error_message))
+                            logging.info(f"[WebSocket] Sent error message to client")
+                        except Exception as send_err:
+                            logging.error(f"[WebSocket] Failed to send error message: {str(send_err)}")
+                        finally:
+                            error_loop.close()
+                    except Exception as error_msg_err:
+                        logging.error(f"[WebSocket] Failed to create error message: {str(error_msg_err)}")
+        
+        # Start agent thread if not already running or if previous thread has died
+        thread_needs_restart = False
+        
+        if session_id not in agent_threads or not agent_threads[session_id].is_alive():
+            logging.info(f"[WebSocket] Starting new agent thread for session_id={session_id}")
+            agent_threads[session_id] = threading.Thread(target=agent_thread)
+            agent_threads[session_id].daemon = True
+            agent_threads[session_id].start()
+            logging.info(f"[WebSocket] Agent thread started successfully with ID: {agent_threads[session_id].ident}")
+        else:
+            logging.info(f"[WebSocket] Using existing agent thread with ID: {agent_threads[session_id].ident}")
+            
+        # Set a longer timeout for the WebSocket connection
+        websocket.client.timeout = 120.0  # 2 minutes timeout
+        logging.info(f"[WebSocket] Set WebSocket timeout to 120 seconds")
+            
+        # Start a background task for ping/pong
+        ping_task = None
+        
+        async def ping_pong():
+            """Send periodic pings to keep the connection alive"""
+            try:
+                while True:
+                    await asyncio.sleep(30)  # Send ping every 30 seconds
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            import json
+                            ping_message = json.dumps({"type": "ping", "timestamp": time.time()})
+                            await websocket.send_text(ping_message)
+                            logging.debug(f"[WebSocket] Sent ping to client: session_id={session_id}")
+                        except Exception as ping_error:
+                            logging.error(f"[WebSocket] Error sending ping: {str(ping_error)}")
+                            break
+                    else:
+                        logging.warning(f"[WebSocket] Connection state not CONNECTED during ping, current state: {websocket.client_state}")
+                        break
+            except Exception as ping_task_error:
+                logging.error(f"[WebSocket] Error in ping task: {str(ping_task_error)}")
+                
+        # Start the ping/pong background task
+        try:
+            from starlette.websockets import WebSocketState
+            ping_task = asyncio.create_task(ping_pong())
+            logging.info(f"[WebSocket] Started ping/pong background task: session_id={session_id}")
+        except Exception as task_error:
+            logging.error(f"[WebSocket] Error creating ping task: {str(task_error)}")
+            
+        try:
+            while True:
+                data = await websocket.receive_text()
+                # Handle potential ping/pong messages from client
+                if data.strip().lower() in ["{\"type\":\"ping\"}", "{\"type\":\"pong\"}"]:
+                    logging.debug(f"[WebSocket] Received ping/pong from client: {data}")
+                    try:
+                        await websocket.send_text('{"type":"pong","timestamp":' + str(time.time()) + '}')
+                    except Exception as pong_error:
+                        logging.error(f"[WebSocket] Error sending pong response: {str(pong_error)}")
+                    continue
+                    
+                logging.info(f"[WebSocket] Received user message from frontend: {data[:100]}...")
+                
+                # Check if this is a test message that should be handled directly
+                try:
+                    import json
+                    message_data = json.loads(data)
+                    
+                    # Skip ping/pong messages - don't add them to the queue
+                    if isinstance(message_data, dict) and message_data.get('type') in ['ping', 'pong']:
+                        logging.debug(f"[WebSocket] Skipping ping/pong message: {message_data.get('type')}")
+                        if message_data.get('type') == 'ping':
+                            await websocket.send_text(json.dumps({"type": "pong", "timestamp": time.time()}))
+                            logging.debug(f"[WebSocket] Sent pong response directly")
+                        continue
+                    
+                    # Handle test echo messages directly without queueing
+                    if isinstance(message_data, dict) and message_data.get('test') == True:
+                        logging.info(f"[WebSocket] Detected test message: {message_data}")
+                        
+                        # Handle echo mode test messages
+                        if message_data.get('echo_mode') == True:
+                            logging.info(f"[WebSocket] Processing echo test message directly")
+                            echo_reply = json.dumps({
+                                "type": "text", 
+                                "content": f"ECHO TEST REPLY: Received '{message_data.get('text')}' at {time.time()}"
+                            })
+                            await websocket.send_text(echo_reply)
+                            logging.info(f"[WebSocket] Sent echo test reply directly")
+                            continue
+                            
+                        # Handle direct test messages
+                        elif message_data.get('bypass_queue') == True:
+                            logging.info(f"[WebSocket] Processing direct test message")
+                            direct_reply = json.dumps({
+                                "type": "text", 
+                                "content": f"DIRECT TEST REPLY: Message processing queue bypassed. Original message: '{message_data.get('text')}'"
+                            })
+                            await websocket.send_text(direct_reply)
+                            logging.info(f"[WebSocket] Sent direct test reply")
+                            continue
+                            
+                    # Handle regular chat messages with direct response for testing
+                    if isinstance(message_data, dict) and 'text' in message_data and isinstance(message_data['text'], str) and not message_data.get('test'):
+                        # For now, add a direct echo response for regular messages to test basic functionality
+                        logging.info(f"[WebSocket] Processing regular chat message directly: {message_data['text'][:50]}...")
+                        
+                        # Extract text from different message formats
+                        message_text = message_data['text']
+                        if isinstance(message_text, dict) and 'content' in message_text:
+                            message_text = message_text['content']
+                            
+                        # Send a direct response to acknowledge receipt of the message
+                        direct_response = {
+                            "type": "text",
+                            "content": f"I received your message: '{message_text}'. Processing your request...",
+                            "isProcessing": True
+                        }
+                        
+                        # Include candidate info in the direct response if we have a candidate_id
+                        if candidate_id:
+                            try:
+                                from services.database import db_operations
+                                candidate_data = db_operations.fetch_candidate_by_id(candidate_id)
+                                
+                                if candidate_data:
+                                    # Extract LinkedIn and GitHub links using our utility function
+                                    from services.utils.resume_parser import extract_linkedin_github_from_resume
+                                    
+                                    linkedin = ""
+                                    github = ""
+                                    
+                                    # Try to get resume data
+                                    if "resume_data" in candidate_data and candidate_data["resume_data"]:
+                                        resume_data = candidate_data["resume_data"]
+                                        linkedin, github = extract_linkedin_github_from_resume(resume_data)
+                                        logging.info(f"[WebSocket] Extracted LinkedIn: {bool(linkedin)}, GitHub: {bool(github)} from resume data")
+                                    
+                                    # Add candidate info to the direct response
+                                    direct_response["candidateInfo"] = {
+                                        "id": candidate_id,
+                                        "name": candidate_data.get("name", ""),
+                                        "email": candidate_data.get("email", ""),
+                                        "resume": {
+                                            "contact": {
+                                                "linkedin": linkedin,
+                                                "github": github
+                                            }
+                                        }
+                                    }
+                                    logging.info(f"[WebSocket] Added candidate info to direct response. LinkedIn: {bool(linkedin)}, GitHub: {bool(github)}")
+                            except Exception as e:
+                                logging.error(f"[WebSocket] Error adding candidate info to direct response: {str(e)}")
+                        
+                        await websocket.send_text(json.dumps(direct_response))
+                        logging.info(f"[WebSocket] Sent simple acknowledgment for regular message")
+                        # Still add to queue for normal processing
+                        logging.info(f"[WebSocket] Also adding message to queue for normal processing")
+                        input_queue.put(data)
+                        continue
+                except Exception as test_error:
+                    logging.error(f"[WebSocket] Error handling test message: {str(test_error)}")
+                
+                # Normal message processing - add to queue
+                input_queue.put(data)
+                # Add a debug message to confirm the message was added to the queue
+                logging.info(f"[WebSocket] Added message to queue: {data[:100]}...")
+                
+                # Update last active time
+                chat_sessions[session_id]["last_active"] = time.time()
+        except WebSocketDisconnect as disconnect_error:
+            logging.warning(f"[WebSocket] Client disconnected: {str(disconnect_error)}")
+            logging.warning(f"[WebSocket] Disconnect code: {getattr(disconnect_error, 'code', 'unknown')}")
+            logging.warning(f"[WebSocket] Disconnect reason: {getattr(disconnect_error, 'reason', 'unknown')}")
+            # Clean up resources for this session
+            logging.error(f"[WebSocket] Error in websocket handler: {str(e)}")
+            logging.error(f"[WebSocket] Error type: {type(e).__name__}")
+            logging.error(traceback.format_exc())
+            # Clean up resources for this session
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+            # Try to send an error message back to the client
+            try:
+                import json
+                error_message = json.dumps({"type": "text", "content": f"Server error: {str(e)}. Please try again."})
+                await websocket.send_text(error_message)
+            except Exception as send_error:
+                logging.error(f"[WebSocket] Could not send error message to client: {str(send_error)}")
+            input_queue.put(None)
+        finally:
+            # Clean up the ping task if it exists
+            if ping_task is not None:
+                try:
+                    ping_task.cancel()
+                    logging.info(f"[WebSocket] Canceled ping task for session_id={session_id}")
+                except Exception as cancel_error:
+                    logging.error(f"[WebSocket] Error canceling ping task: {str(cancel_error)}")
+            
+            # Don't delete the session immediately to allow reconnecting
+            # Just mark it as inactive by updating the timestamp
+            if session_id in chat_sessions:
+                chat_sessions[session_id]["last_active"] = time.time()
+                logging.info(f"[WebSocket] Updated last_active for session_id={session_id}")
+                
+            # Schedule session cleanup after timeout
+            asyncio.create_task(cleanup_session_after_timeout(session_id, 3600))  # 1 hour timeout
+    except Exception as connection_error:
+        logging.error(f"[WebSocket] Connection error: {str(connection_error)}")
+        # We can't send a message to the client if the connection failed
+        try:
+            # Explicitly import json here to avoid the variable scope issue
+            import json
+            logging.info(f"[WebSocket] Connection error handled with json module")
+        except Exception as import_error:
+            logging.error(f"[WebSocket] Error importing json: {str(import_error)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
