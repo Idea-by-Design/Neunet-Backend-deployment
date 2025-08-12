@@ -812,6 +812,9 @@ async def cleanup_session_after_timeout(session_id, timeout_seconds):
 
 @app.websocket("/ws/chat/{session_id}")
 async def websocket_chat(websocket: WebSocket, session_id: str):
+    import logging
+    logging.info(f"[WebSocket] Handler called for session_id={session_id}")
+
     # Extract candidate ID from query parameters if present
     candidate_id = None
     try:
@@ -899,6 +902,14 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                 logging.info(f"[WebSocket] Sent fallback plain text connection confirmation")
             except Exception as fallback_error:
                 logging.error(f"[WebSocket] Error sending fallback confirmation: {str(fallback_error)}")
+        # Minimal async receive loop to keep the connection open and log messages
+        try:
+            while True:
+                data = await websocket.receive_text()
+                logging.info(f"[WebSocket] Received message: {data}")
+                await websocket.send_text(f"Echo: {data}")
+        except Exception as e:
+            logging.error(f"[WebSocket] Error in receive loop: {e}")
         
         # Update last active time for the session
         chat_sessions[session_id]["last_active"] = time.time()
