@@ -907,7 +907,12 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             while True:
                 data = await websocket.receive_text()
                 logging.info(f"[WebSocket] Received message: {data}")  # Log every message received from client
-                await websocket.send_text(f"Echo: {data}")
+                try:
+                    import json
+                    parsed = json.loads(data)
+                    await websocket.send_json(parsed)
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "content": "Invalid JSON received from client.", "details": str(e)})
         except Exception as e:
             logging.error(f"[WebSocket] Error in receive loop: {e}")
         
