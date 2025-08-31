@@ -903,19 +903,6 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             except Exception as fallback_error:
                 logging.error(f"[WebSocket] Error sending fallback confirmation: {str(fallback_error)}")
         # Minimal async receive loop to keep the connection open and log messages
-        try:
-            while True:
-                data = await websocket.receive_text()
-                logging.info(f"[WebSocket] Received message: {data}")  # Log every message received from client
-                try:
-                    import json
-                    parsed = json.loads(data)
-                    await websocket.send_json(parsed)
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "content": "Invalid JSON received from client.", "details": str(e)})
-        except Exception as e:
-            logging.error(f"[WebSocket] Error in receive loop: {e}")
-        
         # Update last active time for the session
         chat_sessions[session_id]["last_active"] = time.time()
     
