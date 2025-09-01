@@ -278,7 +278,7 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
         top_candidates = sorted_candidates[:top_k]
         print(f"Returning top {top_k} candidates for job {job_id}")
         import json
-        return json.dumps(top_candidates)
+        return top_candidates
     except Exception as e:
         print(f"An error occurred while fetching candidates: {e}")
         return []
