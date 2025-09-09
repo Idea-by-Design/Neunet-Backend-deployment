@@ -39,7 +39,6 @@ from services.ai_job_description.generate_description import generate_descriptio
 
 # Import backend functions
 from common.database.cosmos.db_operations import (
-    fetch_top_k_candidates_by_percentage,
     fetch_top_k_candidates_by_count,
     update_application_status,
     execute_sql_query
@@ -68,7 +67,7 @@ fetch_top_k_candidates_by_count_schema = {
         "required": ["job_id"]
     }
 }
-fetch_top_k_candidates_by_percentage_schema = {
+# fetch_top_k_candidates_by_percentage_schema REMOVED
     "name": "fetch_top_k_candidates_by_percentage",
     "description": "Fetch the top X% of candidates for a given job ID.",
     "parameters": {
@@ -125,7 +124,6 @@ executor_agent = autogen.AssistantAgent(
         "config_list": config_list,
         "functions": [
             fetch_top_k_candidates_by_count_schema,
-            fetch_top_k_candidates_by_percentage_schema,
             send_email_schema,
             update_application_status_schema,
             execute_sql_query_schema
@@ -134,7 +132,6 @@ executor_agent = autogen.AssistantAgent(
 )
 executor_agent.register_function(
     function_map={
-        "fetch_top_k_candidates_by_percentage": fetch_top_k_candidates_by_percentage,
         "fetch_top_k_candidates_by_count": fetch_top_k_candidates_by_count,
         "send_email": send_email,
         "update_application_status": update_application_status,

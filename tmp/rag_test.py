@@ -2,7 +2,7 @@ import autogen
 import os
 import chromadb
 
-from common.database.cosmos.db_operations import fetch_top_k_candidates_by_count, fetch_top_k_candidates_by_percentage
+from common.database.cosmos.db_operations import fetch_top_k_candidates_by_count
 from azure.communication.email import EmailClient
 from azure.core.credentials import AzureKeyCredential
 from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent

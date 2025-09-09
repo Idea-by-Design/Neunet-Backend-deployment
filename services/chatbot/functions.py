@@ -1,6 +1,5 @@
 # Multiagent function bridge: import and re-export all multiagent functions for agent registration
 from common.database.cosmos.db_operations import (
-    fetch_top_k_candidates_by_percentage,
     fetch_top_k_candidates_by_count,
     update_application_status,
     execute_sql_query,
