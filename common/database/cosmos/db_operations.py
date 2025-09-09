@@ -273,12 +273,19 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
                 c.get('score') if c.get('score') is not None else
                 (c.get('evaluation', {}).get('total') if isinstance(c.get('evaluation'), dict) and c.get('evaluation', {}).get('total') is not None else 0)
             )
+            # Normalize all rankings to 0-100 scale
+            if ranking is not None and ranking <= 1:
+                ranking = ranking * 100
             c['ranking'] = ranking
             c['job_id'] = c.get('job_id', job_id)
             if not c.get('candidate_id'):
                 # Try to extract from id if possible
                 if c.get('id') and '_' in c['id']:
                     c['candidate_id'] = c['id'].split('_', 1)[-1]
+        # Debug print all candidate rankings before sorting
+        print('CANDIDATE RANKINGS FOR JOB', job_id)
+        for c in valid_candidates:
+            print(f"Candidate: {c.get('name')} | Email: {c.get('email')} | Ranking: {c.get('ranking')}")
         # Sort by ranking descending, fallback to original order if no ranking
         sorted_candidates = sorted(valid_candidates, key=lambda x: x.get('ranking', 0), reverse=True)
         # Limit to top_k
