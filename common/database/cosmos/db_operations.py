@@ -290,6 +290,30 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
         print(f"An error occurred while fetching candidates: {e}")
         return []
 
+def fetch_top_k_candidates_by_percentage(job_id, top_percent=0.1):
+    """
+    Fetch the top X% of candidates for a given job_id.
+    :param job_id: str, the job to query for
+    :param top_percent: float, e.g. 0.1 for top 10%
+    :return: JSON string of top candidate dicts
+    """
+    try:
+        candidates = fetch_top_k_candidates_by_count(job_id, top_k=10000)
+        import json
+        candidates = json.loads(candidates) if isinstance(candidates, str) else candidates
+        if not candidates:
+            return json.dumps([])
+        count = max(1, int(len(candidates) * top_percent))
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda c: c.get('ranking', 0),
+            reverse=True
+        )
+        return json.dumps(sorted_candidates[:count])
+    except Exception as e:
+        print(f"An error occurred in fetch_top_k_candidates_by_percentage: {e}")
+        return json.dumps([])
+
 def fetch_candidate_rankings(job_id):
     try:
         # Include explanation in the query and returned data
