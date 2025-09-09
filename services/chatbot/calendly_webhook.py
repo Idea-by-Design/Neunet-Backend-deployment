@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from common.database.cosmos.db_operations import update_application_status
+from common.database.cosmos.db_operations import update_candidate_status_by_id
 
 app = FastAPI()
 
@@ -17,7 +17,7 @@ async def handle_calendly_webhook(request: Request):
 
             # Validate and update the application status
             if candidate_email and job_id:
-                update_result = update_application_status(
+                update_result = update_candidate_status_by_id(
                     job_id=int(job_id),
                     candidate_email=candidate_email,
                     new_status="Interview Scheduled"

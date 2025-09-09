@@ -40,7 +40,7 @@ from services.ai_job_description.generate_description import generate_descriptio
 # Import backend functions
 from common.database.cosmos.db_operations import (
     fetch_top_k_candidates_by_count,
-    update_application_status,
+    update_candidate_status_by_id,
     execute_sql_query
 )
 from services.chatbot.functions import send_email
@@ -92,8 +92,8 @@ send_email_schema = {
         "required": ["to", "subject", "body"]
     }
 }
-update_application_status_schema = {
-    "name": "update_application_status",
+update_candidate_status_by_id_schema = {
+    "name": "update_candidate_status_by_id",
     "description": "Update the application status for a candidate in a given job.",
     "parameters": {
         "type": "object",
@@ -125,7 +125,7 @@ executor_agent = autogen.AssistantAgent(
         "functions": [
             fetch_top_k_candidates_by_count_schema,
             send_email_schema,
-            update_application_status_schema,
+            update_candidate_status_by_id_schema,
             execute_sql_query_schema
         ]
     },
@@ -134,7 +134,7 @@ executor_agent.register_function(
     function_map={
         "fetch_top_k_candidates_by_count": fetch_top_k_candidates_by_count,
         "send_email": send_email,
-        "update_application_status": update_application_status,
+        "update_candidate_status_by_id": update_candidate_status_by_id,
         "execute_sql_query": execute_sql_query
     }
 )
