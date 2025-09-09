@@ -67,18 +67,6 @@ fetch_top_k_candidates_by_count_schema = {
         "required": ["job_id"]
     }
 }
-# fetch_top_k_candidates_by_percentage_schema REMOVED
-    "name": "fetch_top_k_candidates_by_percentage",
-    "description": "Fetch the top X% of candidates for a given job ID.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "job_id": {"type": "string", "description": "The job ID."},
-            "top_percent": {"type": "number", "description": "Top percentage as a float (e.g., 0.1 for top 10%)."}
-        },
-        "required": ["job_id", "top_percent"]
-    }
-}
 send_email_schema = {
     "name": "send_email",
     "description": "Send an email to a candidate or user.",
