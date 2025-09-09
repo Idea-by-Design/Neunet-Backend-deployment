@@ -266,7 +266,14 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
         for c in valid_candidates:
             email = (c.get('email') or c.get('candidate_email') or '').strip().lower()
             ranking_info = rankings.get(email, {})
-            c['ranking'] = ranking_info.get('ranking', c.get('ranking', None))
+            # Fallback logic: ranking, score, evaluation.total, or 0
+            ranking = (
+                ranking_info.get('ranking') if ranking_info.get('ranking') is not None else
+                c.get('ranking') if c.get('ranking') is not None else
+                c.get('score') if c.get('score') is not None else
+                (c.get('evaluation', {}).get('total') if isinstance(c.get('evaluation'), dict) and c.get('evaluation', {}).get('total') is not None else 0)
+            )
+            c['ranking'] = ranking
             c['job_id'] = c.get('job_id', job_id)
             if not c.get('candidate_id'):
                 # Try to extract from id if possible
