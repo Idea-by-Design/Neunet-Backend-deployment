@@ -22,6 +22,8 @@ A powerful backend service that handles job postings, candidate applications, an
 - Python-Jose (v3.3.0) - JavaScript Object Signing and Encryption implementation
 - Passlib (v1.7.4) - Password hashing library
 - BCrypt (v4.0.1) - Password hashing
+- JWT tokens with expiration (30 min access, 15 min reset)
+- Multiple password reset methods (email, identity verification)
 
 ### Data Validation
 - Pydantic (v2.4.2) - Data validation using Python type annotations
@@ -87,6 +89,15 @@ neunet_ai_services/
    - Candidate ranking
 
 ## API Endpoints
+
+### Authentication
+- `POST /api/auth/signup` - Register new user
+- `POST /api/auth/login` - User login (returns JWT token)
+- `GET /api/auth/me` - Get current user info
+- `POST /api/auth/forgot-password` - Request password reset
+- `POST /api/auth/reset-password` - Reset password with token
+- `POST /api/auth/reset-password-verify-identity` - Reset password via identity verification (no email needed)
+- `POST /api/auth/update-password` - Change password (authenticated)
 
 ### Jobs
 - `POST /jobs/` - Create a new job posting

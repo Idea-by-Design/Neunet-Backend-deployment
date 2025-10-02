@@ -1,8 +1,19 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from services.ai_job_description.generate_description import generate_description
+from services.auth import auth_router
 
 app = FastAPI()
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://neunet.io"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class JobDescriptionRequest(BaseModel):
     title: str = None
@@ -25,7 +36,9 @@ def generate_job_description(request: JobDescriptionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Include routers
 app.include_router(router)
+app.include_router(auth_router)
 
 @app.get("/")
 def read_root():
