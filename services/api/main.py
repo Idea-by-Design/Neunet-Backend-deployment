@@ -28,6 +28,9 @@ from common.database.cosmos import db_operations
 from azure.storage.blob import BlobServiceClient
 import io
 
+# Import auth router
+from services.auth import auth_router
+
 app = FastAPI(title="Neunet Recruitment API")
 
 # --- CORS Middleware (must be before endpoints) ---
@@ -1069,6 +1072,9 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             chat_sessions[session_id]["last_active"] = time.time()
         logging.info(f"[WebSocket] WebSocket connection closed for session {session_id}")
 
+
+# Include auth router
+app.include_router(auth_router)
 
 # Health check endpoint
 @app.get("/health")
