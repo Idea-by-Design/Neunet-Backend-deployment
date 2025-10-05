@@ -271,6 +271,17 @@ async def get_job_questionnaire(job_id: str):
 async def get_job_candidates(job_id: str, top_k: int = 10):
     try:
         candidates = db_operations.fetch_top_k_candidates_by_count(job_id, top_k)
+        # Normalize to a list in case the DB layer returns a JSON string or a single dict
+        if isinstance(candidates, str):
+            import json
+            try:
+                candidates = json.loads(candidates)
+            except Exception:
+                candidates = []
+        elif isinstance(candidates, dict):
+            candidates = [candidates]
+        elif not isinstance(candidates, list):
+            candidates = []
         if not candidates:
             return []
         rankings_map = { (job_id, k.strip().lower()): v for k, v in db_operations.fetch_candidate_rankings(job_id).items() }
@@ -463,13 +474,104 @@ async def get_candidate_by_id(candidate_id: str):
         github_analysis = None
         if norm_github_username:
             github_analysis = db_operations.fetch_github_analysis_by_candidate(candidate_profile.get('email'), norm_github_username)
-        candidate_profile['github_analysis'] = github_analysis
+
+        # Normalize to UI-expected shape
+        def _norm_gha(doc):
+            if not isinstance(doc, dict):
+                return None
+            out = {}
+            # totals
+            out['total_repositories'] = (
+                doc.get('total_repositories')
+                or doc.get('total_public_repos')
+                or doc.get('public_repos')
+                or doc.get('repositories_count')
+                or doc.get('repos_count')
+            )
+            out['total_commits'] = (
+                doc.get('total_commits')
+                or doc.get('commit_count')
+                or doc.get('commits')
+            )
+            # repositories array
+            repos = (
+                doc.get('repositories')
+                or doc.get('top_repositories')
+                or doc.get('repos')
+                or doc.get('repo_summaries')
+            )
+            norm_repos = []
+            if isinstance(repos, list):
+                for r in repos:
+                    if not isinstance(r, dict):
+                        continue
+                    norm_repos.append({
+                        'name': r.get('name') or r.get('repo_name') or r.get('repository'),
+                        'html_url': r.get('html_url') or r.get('url') or r.get('repo_url'),
+                        'language': r.get('language'),
+                        'commit_count': r.get('commit_count') or r.get('commits') or r.get('total_commits'),
+                        'description': r.get('description'),
+                        'pushed_at': r.get('pushed_at') or r.get('last_pushed'),
+                        'contribution_insights': r.get('contribution_insights'),
+                    })
+            out['repositories'] = norm_repos
+            return out
+
+        candidate_profile['github_analysis'] = _norm_gha(github_analysis)
         return candidate_profile
     except Exception as e:
         print(f"[ERROR] Exception in candidate detail endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 from fastapi import Body
+
+@app.get("/settings/{user_email}")
+async def get_user_settings(user_email: str):
+    try:
+        settings = db_operations.fetch_user_settings(user_email)
+        if not settings:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Return only settings-related fields, not password
+        return {
+            "email": settings.get("email"),
+            "company_name": settings.get("company_name", ""),
+            "website": settings.get("website", ""),
+            "email_notifications": settings.get("email_notifications", True),
+            "application_alerts": settings.get("application_alerts", True),
+            "weekly_digest": settings.get("weekly_digest", False),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/settings/{user_email}")
+async def update_settings(user_email: str, data: dict = Body(...)):
+    try:
+        success = db_operations.update_user_settings(user_email, data)
+        if not success:
+            raise HTTPException(status_code=404, detail="User not found or update failed")
+        return {"message": "Settings updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/feedback")
+async def submit_feedback(data: dict = Body(...)):
+    try:
+        user_email = data.get("email")
+        if not user_email:
+            raise HTTPException(status_code=400, detail="Email is required")
+        
+        feedback_data = {
+            "category": data.get("category", "general"),
+            "message": data.get("message", "")
+        }
+        
+        success = db_operations.add_user_feedback(user_email, feedback_data)
+        if not success:
+            raise HTTPException(status_code=404, detail="User not found or feedback submission failed")
+        
+        return {"message": "Feedback submitted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/jobs/{job_id}/candidates/{candidate_id}/status")
 async def update_candidate_status(job_id: str, candidate_id: str, data: dict = Body(...)):

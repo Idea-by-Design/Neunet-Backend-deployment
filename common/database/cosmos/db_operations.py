@@ -104,6 +104,10 @@ def ensure_containers():
             id=config['database']['job_description_questionnaire_container_name'],
             partition_key=PartitionKey(path="/job_id")
         )
+        containers[config['database']['users_container_name']] = database.create_container_if_not_exists(
+            id=config['database']['users_container_name'],
+            partition_key=PartitionKey(path="/email")
+        )
         print("All containers ready")
         return containers
     except Exception as e:
@@ -243,6 +247,18 @@ def fetch_job_description(job_id):
         print(f"An error occurred while fetching job description: {e}")
         return None
 
+def fetch_all_jobs():
+    try:
+        query = "SELECT * FROM c ORDER BY c._ts DESC"
+        items = list(containers[config['database']['job_description_container_name']].query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+        return items
+    except Exception as e:
+        print(f"An error occurred while fetching all jobs: {e}")
+        return []
+
 def fetch_top_k_candidates_by_count(job_id, top_k=10):
     try:
         query = f"""
@@ -255,8 +271,8 @@ def fetch_top_k_candidates_by_count(job_id, top_k=10):
             enable_cross_partition_query=True
         ))
         print("RAW CANDIDATES:", candidates)  # Debug print
-        # Filter out incomplete candidates (missing resume_blob_name)
-        valid_candidates = [c for c in candidates if c.get('resume_blob_name')]
+        # Do not filter by resume_blob_name; include all candidates (align with repo behavior)
+        valid_candidates = candidates
         print("VALID CANDIDATES:", valid_candidates)  # Debug print
         print(f"Found {len(valid_candidates)} valid candidates for job {job_id}")
 
@@ -334,6 +350,24 @@ def fetch_candidate_rankings(job_id):
     except Exception as e:
         print(f"An error occurred while fetching candidate rankings: {e}")
         return {}
+
+def store_candidate_ranking(job_id, candidate_email, ranking, explanation=None):
+    try:
+        from datetime import datetime
+        data = {
+            "id": f"{job_id}_{candidate_email}",
+            "type": "ranking",
+            "job_id": job_id,
+            "candidate_email": candidate_email,
+            "ranking": ranking,
+            "ranked_at": datetime.utcnow().isoformat()
+        }
+        if explanation is not None:
+            data["explanation"] = explanation
+        containers[config['database']['ranking_container_name']].upsert_item(data)
+        print(f"Stored ranking for job {job_id} and {candidate_email}")
+    except Exception as e:
+        print(f"Failed to store candidate ranking: {e}")
 
 def update_recruitment_process(job_id, candidate_email, status, additional_info=None):
     valid_statuses = [
@@ -477,6 +511,178 @@ def fetch_resume_with_email(email):
     except Exception as e:
         print(f"An error occurred while fetching resume: {e}")
         return None
+
+def upsert_github_analysis(candidate_email, github_identifier, analysis_result):
+    """Upsert GitHub analysis for a candidate (by email + github_identifier)"""
+    print(f"[DEBUG] Attempting upsert_github_analysis with candidate_email={candidate_email}, github_identifier={github_identifier}")
+    print(f"[DEBUG] Analysis result: {repr(analysis_result)[:300]}")
+    item = {
+        "id": f"github_analysis_{candidate_email}_{github_identifier}",
+        "candidate_email": candidate_email,
+        "github_identifier": github_identifier,
+        "type": "github_analysis",
+        "result": analysis_result,
+        "created_at": datetime.utcnow().isoformat(),
+        "email": candidate_email  # for partition key compatibility
+    }
+    try:
+        containers[config['database']['github_container_name']].upsert_item(item)
+        print(f"[INFO] GitHub analysis upserted for candidate_email={candidate_email}, github_identifier={github_identifier}")
+    except Exception as e:
+        print(f"[ERROR] Upsert failed: {e}")
+        # If conflict, fetch existing, update, and replace
+        if hasattr(e, 'status_code') and e.status_code == 409:
+            print(f"[DEBUG] Conflict detected. Attempting to update existing record for candidate_email={candidate_email}, github_identifier={github_identifier}")
+            query = (
+                f"SELECT * FROM c WHERE c.type = 'github_analysis' "
+                f"AND c.candidate_email = '{candidate_email}' "
+                f"AND c.github_identifier = '{github_identifier}'"
+            )
+            print(f"[DEBUG] Running fallback query: {query}")
+            existing = list(containers[config['database']['github_container_name']].query_items(query=query, enable_cross_partition_query=True))
+            print(f"[DEBUG] Fallback query returned {len(existing)} results: {existing}")
+            if existing:
+                doc = existing[0]
+                print(f"[DEBUG] Existing doc id: {doc.get('id')}, partition_key: {doc.get('email')}")
+                doc['result'] = analysis_result
+                doc['created_at'] = datetime.utcnow().isoformat()
+                containers[config['database']['github_container_name']].replace_item(item=doc['id'], partition_key=doc['email'], body=doc)
+                print(f"[INFO] Existing GitHub analysis updated for candidate_email={candidate_email}, github_identifier={github_identifier}")
+            else:
+                print(f"[ERROR] Conflict but no existing record found for candidate_email={candidate_email}, github_identifier={github_identifier}")
+        else:
+            raise
+
+def fetch_github_analysis_by_candidate(email, github_username):
+    """Fetch GitHub analysis for a candidate (by email + github_identifier). Returns the nested 'result' payload."""
+    try:
+        email_norm = (email or "").strip().lower()
+        user_norm = (github_username or "").strip().lower()
+        query = f"""
+        SELECT * FROM c
+        WHERE c.type = 'github_analysis'
+          AND LOWER(c.candidate_email) = '{email_norm}'
+          AND LOWER(c.github_identifier) = '{user_norm}'
+        """
+        items = list(containers[config['database']['github_container_name']].query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+        if items:
+            return items[0].get("result")  # Return nested result, not wrapper
+        return None
+    except Exception as e:
+        print(f"An error occurred while fetching GitHub analysis: {e}")
+        return None
+
+def fetch_user_settings(user_email):
+    """Fetch user settings by email."""
+    try:
+        query = f"SELECT * FROM c WHERE c.email = '{user_email}'"
+        items = list(containers[config['database']['users_container_name']].query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+        if items:
+            return items[0]
+        return None
+    except Exception as e:
+        print(f"An error occurred while fetching user settings: {e}")
+        return None
+
+def update_user_settings(user_email, settings_data):
+    """Update user settings (company info, notifications, etc.)."""
+    try:
+        # Fetch existing user doc
+        user = fetch_user_settings(user_email)
+        if not user:
+            print(f"User not found: {user_email}")
+            return False
+        
+        # Update settings fields
+        user['company_name'] = settings_data.get('company_name', user.get('company_name', ''))
+        user['website'] = settings_data.get('website', user.get('website', ''))
+        user['email_notifications'] = settings_data.get('email_notifications', user.get('email_notifications', True))
+        user['application_alerts'] = settings_data.get('application_alerts', user.get('application_alerts', True))
+        user['weekly_digest'] = settings_data.get('weekly_digest', user.get('weekly_digest', False))
+        
+        # Upsert back to container
+        containers[config['database']['users_container_name']].upsert_item(user)
+        print(f"User settings updated for {user_email}")
+        return True
+    except Exception as e:
+        print(f"An error occurred while updating user settings: {e}")
+        return False
+
+def add_user_feedback(user_email, feedback_data):
+    """Add feedback to user's feedback array."""
+    try:
+        import uuid
+        # Fetch existing user doc
+        user = fetch_user_settings(user_email)
+        if not user:
+            print(f"User not found: {user_email}")
+            return False
+        
+        # Initialize feedback array if it doesn't exist
+        if 'feedback' not in user:
+            user['feedback'] = []
+        
+        # Create feedback entry with unique ID and timestamp
+        feedback_entry = {
+            'feedback_id': str(uuid.uuid4()),
+            'category': feedback_data.get('category', 'general'),
+            'message': feedback_data.get('message', ''),
+            'created_at': datetime.utcnow().isoformat(),
+            'status': 'new'
+        }
+        
+        # Append to feedback array
+        user['feedback'].append(feedback_entry)
+        
+        # Upsert back to container
+        containers[config['database']['users_container_name']].upsert_item(user)
+        print(f"Feedback added for {user_email}, feedback_id: {feedback_entry['feedback_id']}")
+        return True
+    except Exception as e:
+        print(f"An error occurred while adding feedback: {e}")
+        return False
+
+def fetch_candidates_with_github_links():
+    """Fetch all candidates with GitHub links from application container."""
+    try:
+        query = """
+        SELECT DISTINCT c.email, c.parsed_resume
+        FROM c
+        WHERE c.type = 'candidate'
+          AND (IS_DEFINED(c.parsed_resume.links.github) 
+               OR IS_DEFINED(c.parsed_resume.links.gitHub)
+               OR IS_DEFINED(c.parsed_resume.github))
+        """
+        items = list(containers[config['database']['application_container_name']].query_items(
+            query=query, enable_cross_partition_query=True
+        ))
+        candidates = []
+        for item in items:
+            pr = item.get('parsed_resume', {})
+            if isinstance(pr, str):
+                import json
+                try:
+                    pr = json.loads(pr)
+                except:
+                    pr = {}
+            github = (
+                pr.get('links', {}).get('github')
+                or pr.get('links', {}).get('gitHub')
+                or pr.get('github')
+            )
+            if github:
+                candidates.append({'email': item['email'], 'github': github})
+        print(f"[INFO] Found {len(candidates)} candidates with GitHub links")
+        return candidates
+    except Exception as e:
+        print(f"An error occurred while fetching candidates with GitHub links: {e}")
+        return []
 
 def fetch_application_by_job_id(job_id):
     try:

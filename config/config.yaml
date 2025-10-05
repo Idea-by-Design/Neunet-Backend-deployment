@@ -9,6 +9,7 @@ database:
   job_description_container_name: "jobDetails"
   application_container_name: "applications"
   job_description_questionnaire_container_name: "jobDescriptionQuestionnaire"
+  users_container_name: "users"
 
 azure:
   storage_account_name: "neunetstotage"
