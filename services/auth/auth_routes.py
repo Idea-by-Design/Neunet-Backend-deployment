@@ -381,15 +381,40 @@ async def logout(request: Request, logout_data: LogoutRequest):
     """
     try:
         print(f"[LOGOUT] Logging logout for user: {logout_data.email}")
-        metadata = {
-            'ip': request.client.host if request.client else None,
-            'user_agent': request.headers.get('user-agent', 'unknown')
+        
+        # Get user from auth container
+        container = get_users_container()
+        query = f"SELECT * FROM c WHERE c.email = '{logout_data.email}'"
+        users = list(container.query_items(query=query, enable_cross_partition_query=True))
+        
+        if not users:
+            print(f"[LOGOUT] User not found: {logout_data.email}")
+            return SuccessResponse(message="Logged out successfully")
+        
+        user = users[0]
+        
+        # Initialize activity_logs if doesn't exist
+        if 'activity_logs' not in user:
+            user['activity_logs'] = []
+        
+        # Create logout entry
+        logout_entry = {
+            'activity_id': str(uuid.uuid4()),
+            'type': 'logout',
+            'timestamp': datetime.utcnow().isoformat(),
+            'metadata': {
+                'ip': request.client.host if request.client else None,
+                'user_agent': request.headers.get('user-agent', 'unknown')
+            }
         }
-        success = db_operations.log_user_activity(logout_data.email, 'logout', metadata)
-        if success:
-            print(f"[LOGOUT] Successfully logged logout for {logout_data.email}")
-        else:
-            print(f"[LOGOUT] Failed to log logout for {logout_data.email}")
+        
+        user['activity_logs'].append(logout_entry)
+        user['last_logout'] = logout_entry['timestamp']
+        
+        # Save to database
+        container.upsert_item(user)
+        print(f"[LOGOUT] Successfully logged logout for {logout_data.email} at {logout_entry['timestamp']}")
+        
         return SuccessResponse(message="Logged out successfully")
     except Exception as e:
         print(f"[LOGOUT ERROR] {str(e)}")
