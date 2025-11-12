@@ -369,19 +369,30 @@ async def reset_password_verify_identity(request: VerifyIdentityResetRequest):
             detail=f"Database error: {str(e)}"
         )
 
+from pydantic import BaseModel
+
+class LogoutRequest(BaseModel):
+    email: str
+
 @router.post("/logout", response_model=SuccessResponse)
-async def logout(request: Request, email: str):
+async def logout(request: Request, logout_data: LogoutRequest):
     """
     Log user logout activity
     """
     try:
+        print(f"[LOGOUT] Logging logout for user: {logout_data.email}")
         metadata = {
             'ip': request.client.host if request.client else None,
             'user_agent': request.headers.get('user-agent', 'unknown')
         }
-        db_operations.log_user_activity(email, 'logout', metadata)
+        success = db_operations.log_user_activity(logout_data.email, 'logout', metadata)
+        if success:
+            print(f"[LOGOUT] Successfully logged logout for {logout_data.email}")
+        else:
+            print(f"[LOGOUT] Failed to log logout for {logout_data.email}")
         return SuccessResponse(message="Logged out successfully")
     except Exception as e:
+        print(f"[LOGOUT ERROR] {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error logging logout: {str(e)}"
