@@ -1,10 +1,11 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Request
 from azure.cosmos import exceptions
 from datetime import datetime
 import uuid
 from .models import UserSignup, UserLogin, TokenResponse, UserResponse, UserInDB, ForgotPasswordRequest, ResetPasswordRequest, UpdatePasswordRequest, SuccessResponse, VerifyIdentityResetRequest
 from .auth_utils import get_password_hash, verify_password, create_access_token
 from .database import get_users_container
+from common.database.cosmos import db_operations
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 
@@ -77,7 +78,7 @@ async def signup(user_data: UserSignup):
     )
 
 @router.post("/login", response_model=TokenResponse)
-async def login(credentials: UserLogin):
+async def login(credentials: UserLogin, request: Request):
     """
     Authenticate user and return access token
     """
@@ -101,6 +102,13 @@ async def login(credentials: UserLogin):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password"
             )
+        
+        # Log login activity
+        metadata = {
+            'ip': request.client.host if request.client else None,
+            'user_agent': request.headers.get('user-agent', 'unknown')
+        }
+        db_operations.log_user_activity(user['email'], 'login', metadata)
         
         # Create access token
         access_token = create_access_token(
@@ -359,4 +367,41 @@ async def reset_password_verify_identity(request: VerifyIdentityResetRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {str(e)}"
+        )
+
+@router.post("/logout", response_model=SuccessResponse)
+async def logout(request: Request, email: str):
+    """
+    Log user logout activity
+    """
+    try:
+        metadata = {
+            'ip': request.client.host if request.client else None,
+            'user_agent': request.headers.get('user-agent', 'unknown')
+        }
+        db_operations.log_user_activity(email, 'logout', metadata)
+        return SuccessResponse(message="Logged out successfully")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error logging logout: {str(e)}"
+        )
+
+@router.get("/user-stats/{email}")
+async def get_user_stats(email: str):
+    """
+    Get user activity statistics including session duration and total time on site
+    """
+    try:
+        stats = db_operations.get_user_session_stats(email)
+        if stats is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found or no activity data"
+            )
+        return stats
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching user stats: {str(e)}"
         )

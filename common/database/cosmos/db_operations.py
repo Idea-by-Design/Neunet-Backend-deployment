@@ -648,6 +648,98 @@ def add_user_feedback(user_email, feedback_data):
         print(f"An error occurred while adding feedback: {e}")
         return False
 
+def log_user_activity(user_email, activity_type, metadata=None):
+    """
+    Log user activity (login, logout, etc.) with timestamp.
+    
+    Args:
+        user_email: User's email
+        activity_type: 'login' or 'logout'
+        metadata: Optional dict with additional info (e.g., IP, user agent)
+    """
+    try:
+        import uuid
+        # Fetch existing user doc
+        user = fetch_user_settings(user_email)
+        if not user:
+            print(f"User not found: {user_email}")
+            return False
+        
+        # Initialize activity_logs array if it doesn't exist
+        if 'activity_logs' not in user:
+            user['activity_logs'] = []
+        
+        # Create activity log entry
+        activity_entry = {
+            'activity_id': str(uuid.uuid4()),
+            'type': activity_type,  # 'login' or 'logout'
+            'timestamp': datetime.utcnow().isoformat(),
+            'metadata': metadata or {}
+        }
+        
+        # Append to activity_logs array
+        user['activity_logs'].append(activity_entry)
+        
+        # Update last_login or last_logout timestamp
+        if activity_type == 'login':
+            user['last_login'] = activity_entry['timestamp']
+        elif activity_type == 'logout':
+            user['last_logout'] = activity_entry['timestamp']
+        
+        # Upsert back to container
+        containers[config['database']['users_container_name']].upsert_item(user)
+        print(f"Activity logged for {user_email}: {activity_type} at {activity_entry['timestamp']}")
+        return True
+    except Exception as e:
+        print(f"An error occurred while logging activity: {e}")
+        return False
+
+def get_user_session_stats(user_email):
+    """
+    Calculate session statistics for a user.
+    Returns total sessions, average session duration, total time on site.
+    """
+    try:
+        user = fetch_user_settings(user_email)
+        if not user or 'activity_logs' not in user:
+            return {
+                'total_sessions': 0,
+                'total_time_seconds': 0,
+                'average_session_seconds': 0,
+                'last_login': None,
+                'last_logout': None
+            }
+        
+        logs = user['activity_logs']
+        sessions = []
+        current_login = None
+        
+        # Pair up login/logout events to calculate session durations
+        for log in logs:
+            if log['type'] == 'login':
+                current_login = datetime.fromisoformat(log['timestamp'])
+            elif log['type'] == 'logout' and current_login:
+                logout_time = datetime.fromisoformat(log['timestamp'])
+                duration = (logout_time - current_login).total_seconds()
+                sessions.append(duration)
+                current_login = None
+        
+        total_time = sum(sessions)
+        avg_time = total_time / len(sessions) if sessions else 0
+        
+        return {
+            'total_sessions': len(sessions),
+            'total_time_seconds': total_time,
+            'total_time_hours': round(total_time / 3600, 2),
+            'average_session_seconds': round(avg_time, 2),
+            'average_session_minutes': round(avg_time / 60, 2),
+            'last_login': user.get('last_login'),
+            'last_logout': user.get('last_logout')
+        }
+    except Exception as e:
+        print(f"An error occurred while calculating session stats: {e}")
+        return None
+
 def fetch_candidates_with_github_links():
     """Fetch all candidates with GitHub links from application container."""
     try:
