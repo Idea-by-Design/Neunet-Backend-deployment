@@ -1,0 +1,19 @@
+name: Weekly Analytics Report
+
+on:
+  schedule:
+    # Run every Monday at 9:00 AM UTC (2:30 PM IST)
+    - cron: '0 9 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  send-weekly-report:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Send Weekly Analytics Report
+        run: |
+          curl -X POST "https://neunet-ai-services.onrender.com/api/auth/analytics/send-weekly-report?recipient_email=${{ secrets.REPORT_EMAIL }}&days=7" \
+            -H "Content-Type: application/json"
+        env:
+          REPORT_EMAIL: ${{ secrets.REPORT_EMAIL }}

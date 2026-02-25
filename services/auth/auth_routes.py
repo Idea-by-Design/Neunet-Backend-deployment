@@ -441,3 +441,61 @@ async def get_user_stats(email: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error fetching user stats: {str(e)}"
         )
+
+@router.get("/analytics/weekly-report")
+async def get_weekly_analytics_report(days: int = 7):
+    """
+    Get weekly analytics report for all users.
+    Returns user activity, session stats, and feedback for the specified period.
+    
+    Args:
+        days: Number of days to include in the report (default: 7)
+    """
+    try:
+        report = db_operations.get_weekly_analytics_report(days)
+        if report is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate analytics report"
+            )
+        return report
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error generating analytics report: {str(e)}"
+        )
+
+@router.post("/analytics/send-weekly-report")
+async def send_weekly_analytics_report(recipient_email: str, days: int = 7):
+    """
+    Generate and send weekly analytics report via email.
+    
+    Args:
+        recipient_email: Email address to send the report to
+        days: Number of days to include in the report (default: 7)
+    """
+    try:
+        from common.utils.email_service import send_analytics_email
+        
+        # Generate report
+        report = db_operations.get_weekly_analytics_report(days)
+        if report is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to generate analytics report"
+            )
+        
+        # Send email
+        success = send_analytics_email(report, recipient_email)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to send email. Check email configuration."
+            )
+        
+        return SuccessResponse(message=f"Analytics report sent successfully to {recipient_email}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error sending analytics report: {str(e)}"
+        )

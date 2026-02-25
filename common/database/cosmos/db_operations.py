@@ -740,6 +740,120 @@ def get_user_session_stats(user_email):
         print(f"An error occurred while calculating session stats: {e}")
         return None
 
+def get_weekly_analytics_report(days=7):
+    """
+    Generate weekly analytics report for all users.
+    Returns user activity, session stats, and feedback for the past N days.
+    """
+    try:
+        from datetime import datetime, timedelta
+        
+        # Calculate date range
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days)
+        
+        # Fetch all users
+        query = "SELECT * FROM c"
+        users = list(containers[config['database']['users_container_name']].query_items(
+            query=query, enable_cross_partition_query=True
+        ))
+        
+        report = {
+            'report_generated': end_date.isoformat(),
+            'period': f'Last {days} days',
+            'start_date': start_date.isoformat(),
+            'end_date': end_date.isoformat(),
+            'total_users': len(users),
+            'users': []
+        }
+        
+        for user in users:
+            user_data = {
+                'email': user.get('email'),
+                'name': user.get('name'),
+                'username': user.get('username'),
+                'company_size': user.get('company_size'),
+                'created_at': user.get('created_at'),
+                'last_login': user.get('last_login'),
+                'last_logout': user.get('last_logout'),
+                'activity_in_period': [],
+                'feedback_in_period': [],
+                'session_stats': {}
+            }
+            
+            # Filter activity logs for the period
+            activity_logs = user.get('activity_logs', [])
+            for log in activity_logs:
+                log_time = datetime.fromisoformat(log['timestamp'])
+                if start_date <= log_time <= end_date:
+                    user_data['activity_in_period'].append({
+                        'type': log['type'],
+                        'timestamp': log['timestamp'],
+                        'ip': log.get('metadata', {}).get('ip'),
+                        'user_agent': log.get('metadata', {}).get('user_agent')
+                    })
+            
+            # Filter feedback for the period
+            feedback_entries = user.get('feedback', [])
+            for feedback in feedback_entries:
+                feedback_time = datetime.fromisoformat(feedback['timestamp'])
+                if start_date <= feedback_time <= end_date:
+                    user_data['feedback_in_period'].append({
+                        'category': feedback.get('category'),
+                        'message': feedback.get('message'),
+                        'timestamp': feedback['timestamp']
+                    })
+            
+            # Calculate session stats for the period
+            logins = [a for a in user_data['activity_in_period'] if a['type'] == 'login']
+            logouts = [a for a in user_data['activity_in_period'] if a['type'] == 'logout']
+            
+            user_data['session_stats'] = {
+                'total_logins': len(logins),
+                'total_logouts': len(logouts),
+                'total_feedback': len(user_data['feedback_in_period'])
+            }
+            
+            # Calculate total time spent (pair logins with logouts)
+            sessions = []
+            sorted_activities = sorted(user_data['activity_in_period'], key=lambda x: x['timestamp'])
+            current_login = None
+            for activity in sorted_activities:
+                if activity['type'] == 'login':
+                    current_login = datetime.fromisoformat(activity['timestamp'])
+                elif activity['type'] == 'logout' and current_login:
+                    logout_time = datetime.fromisoformat(activity['timestamp'])
+                    duration = (logout_time - current_login).total_seconds()
+                    sessions.append(duration)
+                    current_login = None
+            
+            if sessions:
+                total_time = sum(sessions)
+                user_data['session_stats']['total_time_seconds'] = total_time
+                user_data['session_stats']['total_time_hours'] = round(total_time / 3600, 2)
+                user_data['session_stats']['average_session_minutes'] = round((total_time / len(sessions)) / 60, 2)
+            else:
+                user_data['session_stats']['total_time_seconds'] = 0
+                user_data['session_stats']['total_time_hours'] = 0
+                user_data['session_stats']['average_session_minutes'] = 0
+            
+            # Only include users with activity or feedback in the period
+            if user_data['activity_in_period'] or user_data['feedback_in_period']:
+                report['users'].append(user_data)
+        
+        # Add summary stats
+        report['summary'] = {
+            'active_users': len(report['users']),
+            'total_logins': sum(u['session_stats']['total_logins'] for u in report['users']),
+            'total_feedback': sum(u['session_stats']['total_feedback'] for u in report['users']),
+            'total_hours_spent': round(sum(u['session_stats']['total_time_hours'] for u in report['users']), 2)
+        }
+        
+        return report
+    except Exception as e:
+        print(f"An error occurred while generating weekly report: {e}")
+        return None
+
 def fetch_candidates_with_github_links():
     """Fetch all candidates with GitHub links from application container."""
     try:
