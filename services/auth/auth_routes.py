@@ -452,14 +452,19 @@ async def get_weekly_analytics_report(days: int = 7):
         days: Number of days to include in the report (default: 7)
     """
     try:
+        import traceback
         report = db_operations.get_weekly_analytics_report(days)
         if report is None:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to generate analytics report"
+                detail="Failed to generate analytics report - returned None"
             )
         return report
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"[API ERROR] Analytics report error: {str(e)}")
+        print(f"[API ERROR] Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error generating analytics report: {str(e)}"

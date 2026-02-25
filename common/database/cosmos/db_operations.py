@@ -746,17 +746,24 @@ def get_weekly_analytics_report(days=7):
     Returns user activity, session stats, and feedback for the past N days.
     """
     try:
-        from datetime import datetime, timedelta
+        from datetime import timedelta
+        
+        print(f"[ANALYTICS] Generating report for last {days} days")
         
         # Calculate date range
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=days)
         
+        print(f"[ANALYTICS] Date range: {start_date} to {end_date}")
+        
         # Fetch all users
         query = "SELECT * FROM c"
+        print(f"[ANALYTICS] Fetching users from container: {config['database']['users_container_name']}")
         users = list(containers[config['database']['users_container_name']].query_items(
             query=query, enable_cross_partition_query=True
         ))
+        
+        print(f"[ANALYTICS] Found {len(users)} total users")
         
         report = {
             'report_generated': end_date.isoformat(),
@@ -849,10 +856,13 @@ def get_weekly_analytics_report(days=7):
             'total_hours_spent': round(sum(u['session_stats']['total_time_hours'] for u in report['users']), 2)
         }
         
+        print(f"[ANALYTICS] Report generated successfully with {len(report['users'])} active users")
         return report
     except Exception as e:
-        print(f"An error occurred while generating weekly report: {e}")
-        return None
+        import traceback
+        print(f"[ANALYTICS ERROR] An error occurred while generating weekly report: {e}")
+        print(f"[ANALYTICS ERROR] Traceback: {traceback.format_exc()}")
+        raise e
 
 def fetch_candidates_with_github_links():
     """Fetch all candidates with GitHub links from application container."""
