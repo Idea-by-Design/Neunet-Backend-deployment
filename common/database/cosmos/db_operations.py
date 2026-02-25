@@ -791,25 +791,39 @@ def get_weekly_analytics_report(days=7):
             # Filter activity logs for the period
             activity_logs = user.get('activity_logs', [])
             for log in activity_logs:
-                log_time = datetime.fromisoformat(log['timestamp'])
-                if start_date <= log_time <= end_date:
-                    user_data['activity_in_period'].append({
-                        'type': log['type'],
-                        'timestamp': log['timestamp'],
-                        'ip': log.get('metadata', {}).get('ip'),
-                        'user_agent': log.get('metadata', {}).get('user_agent')
-                    })
+                # Skip if timestamp is missing
+                if 'timestamp' not in log:
+                    continue
+                try:
+                    log_time = datetime.fromisoformat(log['timestamp'])
+                    if start_date <= log_time <= end_date:
+                        user_data['activity_in_period'].append({
+                            'type': log.get('type', 'unknown'),
+                            'timestamp': log['timestamp'],
+                            'ip': log.get('metadata', {}).get('ip'),
+                            'user_agent': log.get('metadata', {}).get('user_agent')
+                        })
+                except (ValueError, TypeError) as e:
+                    print(f"[ANALYTICS] Skipping invalid activity log timestamp: {log.get('timestamp')} - {e}")
+                    continue
             
             # Filter feedback for the period
             feedback_entries = user.get('feedback', [])
             for feedback in feedback_entries:
-                feedback_time = datetime.fromisoformat(feedback['timestamp'])
-                if start_date <= feedback_time <= end_date:
-                    user_data['feedback_in_period'].append({
-                        'category': feedback.get('category'),
-                        'message': feedback.get('message'),
-                        'timestamp': feedback['timestamp']
-                    })
+                # Skip if timestamp is missing
+                if 'timestamp' not in feedback:
+                    continue
+                try:
+                    feedback_time = datetime.fromisoformat(feedback['timestamp'])
+                    if start_date <= feedback_time <= end_date:
+                        user_data['feedback_in_period'].append({
+                            'category': feedback.get('category', 'General'),
+                            'message': feedback.get('message', ''),
+                            'timestamp': feedback['timestamp']
+                        })
+                except (ValueError, TypeError) as e:
+                    print(f"[ANALYTICS] Skipping invalid feedback timestamp: {feedback.get('timestamp')} - {e}")
+                    continue
             
             # Calculate session stats for the period
             logins = [a for a in user_data['activity_in_period'] if a['type'] == 'login']
@@ -823,16 +837,21 @@ def get_weekly_analytics_report(days=7):
             
             # Calculate total time spent (pair logins with logouts)
             sessions = []
-            sorted_activities = sorted(user_data['activity_in_period'], key=lambda x: x['timestamp'])
+            sorted_activities = sorted(user_data['activity_in_period'], key=lambda x: x.get('timestamp', ''))
             current_login = None
             for activity in sorted_activities:
-                if activity['type'] == 'login':
-                    current_login = datetime.fromisoformat(activity['timestamp'])
-                elif activity['type'] == 'logout' and current_login:
-                    logout_time = datetime.fromisoformat(activity['timestamp'])
-                    duration = (logout_time - current_login).total_seconds()
-                    sessions.append(duration)
-                    current_login = None
+                try:
+                    if activity.get('type') == 'login':
+                        current_login = datetime.fromisoformat(activity['timestamp'])
+                    elif activity.get('type') == 'logout' and current_login:
+                        logout_time = datetime.fromisoformat(activity['timestamp'])
+                        duration = (logout_time - current_login).total_seconds()
+                        if duration > 0:  # Only add positive durations
+                            sessions.append(duration)
+                        current_login = None
+                except (ValueError, TypeError, KeyError) as e:
+                    print(f"[ANALYTICS] Error calculating session duration: {e}")
+                    continue
             
             if sessions:
                 total_time = sum(sessions)
